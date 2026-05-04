@@ -229,11 +229,12 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
 // ---- FD table -------------------------------------------------------------
 
-/// A file descriptor can refer to a regular file or a pipe end.
+/// A file descriptor can refer to a regular file, pipe end, or console.
 pub enum FdKind {
     FileDesc(Box<File>),
     PipeRead(u32),   // pipe ID, read end
     PipeWrite(u32),  // pipe ID, write end
+    Console,         // stdin/stdout/stderr (handled specially in syscall layer)
 }
 
 /// File descriptor table for a user process.
@@ -242,17 +243,18 @@ pub struct FdTable {
 }
 
 impl FdTable {
-    /// Create a new FD table with stdin (0) and stdout (1) reserved.
+    /// Create a new FD table with stdin (0), stdout (1), stderr (2).
     pub fn new() -> Box<Self> {
         let mut ft = Box::new(FdTable { files: Vec::new() });
-        ft.files.push(None); // fd 0 = stdin
-        ft.files.push(None); // fd 1 = stdout
+        ft.files.push(Some(FdKind::Console)); // fd 0 = stdin
+        ft.files.push(Some(FdKind::Console)); // fd 1 = stdout
+        ft.files.push(Some(FdKind::Console)); // fd 2 = stderr
         ft
     }
 
     /// Allocate the lowest available fd for a given FdKind.
     fn alloc_fd(&mut self, kind: FdKind) -> i32 {
-        for i in 2..self.files.len() {
+        for i in 0..self.files.len() {
             if self.files[i].is_none() {
                 self.files[i] = Some(kind);
                 return i as i32;
@@ -280,14 +282,14 @@ impl FdTable {
 
     /// Get a mutable reference to the File at `fd`, or None if not a file.
     pub fn get(&mut self, fd: i32) -> Option<&mut File> {
-        if fd < 2 { return None; }
+        if fd < 0 || (fd as usize) >= self.files.len() { return None; }
         match self.files.get_mut(fd as usize)? {
             Some(FdKind::FileDesc(f)) => Some(&mut **f),
             _ => None,
         }
     }
 
-    /// Get the FdKind at `fd` (for pipe dispatch).
+    /// Get the FdKind at `fd` (for pipe/console dispatch).
     pub fn get_kind(&self, fd: i32) -> Option<&FdKind> {
         if fd < 0 || (fd as usize) >= self.files.len() { return None; }
         self.files[fd as usize].as_ref()
@@ -295,7 +297,7 @@ impl FdTable {
 
     /// Close the fd. Returns true if it was open.
     pub fn close(&mut self, fd: i32) -> bool {
-        if fd < 2 { return false; }
+        if fd < 0 || (fd as usize) >= self.files.len() { return false; }
         if let Some(slot) = self.files.get_mut(fd as usize) {
             if let Some(kind) = slot.take() {
                 match kind {
@@ -310,6 +312,7 @@ impl FdTable {
                             pipe.close_write();
                         }
                     }
+                    FdKind::Console => {} // nothing to release
                 }
                 return true;
             }
@@ -319,9 +322,22 @@ impl FdTable {
 
     /// Close all open fds (process exit).
     pub fn close_all(&mut self) {
-        for i in 2..self.files.len() {
-            if self.files[i].is_some() {
-                self.close(i as i32);
+        for slot in self.files.iter_mut() {
+            if let Some(kind) = slot.take() {
+                match kind {
+                    FdKind::FileDesc(file) => file.close_file(),
+                    FdKind::PipeRead(id) => {
+                        if let Some(pipe) = crate::pipe::get_pipe(id) {
+                            pipe.close_read();
+                        }
+                    }
+                    FdKind::PipeWrite(id) => {
+                        if let Some(pipe) = crate::pipe::get_pipe(id) {
+                            pipe.close_write();
+                        }
+                    }
+                    FdKind::Console => {}
+                }
             }
         }
     }
@@ -331,11 +347,15 @@ impl FdTable {
         if fd < 0 || (fd as usize) >= self.files.len() { return -1; }
 
         match &self.files[fd as usize] {
+            Some(FdKind::Console) => {
+                self.alloc_fd(FdKind::Console)
+            }
             Some(FdKind::FileDesc(file)) => {
                 let sector = file.inode_sector;
+                let pos = file.pos;
                 match File::open(sector) {
                     Some(mut new_file) => {
-                        new_file.seek(file.pos);
+                        new_file.seek(pos);
                         self.alloc_fd(FdKind::FileDesc(new_file))
                     }
                     None => -1,
@@ -639,6 +659,7 @@ fn clone_fd_table(_parent_tid: i32) -> *mut FdTable {
             }
             Some(FdKind::PipeRead(id)) => Some(FdKind::PipeRead(*id)),
             Some(FdKind::PipeWrite(id)) => Some(FdKind::PipeWrite(*id)),
+            Some(FdKind::Console) => Some(FdKind::Console),
             None => None,
         };
     }

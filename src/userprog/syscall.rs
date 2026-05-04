@@ -130,28 +130,25 @@ fn unpin_user_pages(tid: i32, addr: usize, size: usize) {
 
 fn sys_write(fd: i32, buf_addr: usize, size: usize) -> i32 {
     validate_user_buffer(buf_addr, size);
-
-    if fd == 1 || fd == 2 {
-        let buf = unsafe { core::slice::from_raw_parts(buf_addr as *const u8, size) };
-        if let Ok(s) = core::str::from_utf8(buf) {
-            crate::kprint!("{}", s);
-        } else {
-            for &b in buf { crate::devices::serial::putc(b); }
-        }
-        return size as i32;
-    }
     if fd < 0 { return -1; }
 
-    // Check if it's a pipe
     let fd_table = super::process::get_fd_table();
     match fd_table.get_kind(fd) {
+        Some(FdKind::Console) => {
+            let buf = unsafe { core::slice::from_raw_parts(buf_addr as *const u8, size) };
+            if let Ok(s) = core::str::from_utf8(buf) {
+                crate::kprint!("{}", s);
+            } else {
+                for &b in buf { crate::devices::serial::putc(b); }
+            }
+            size as i32
+        }
         Some(FdKind::PipeWrite(pipe_id)) => {
             let pipe_id = *pipe_id;
             if let Some(pipe) = crate::pipe::get_pipe(pipe_id) {
                 let buf = unsafe { core::slice::from_raw_parts(buf_addr as *const u8, size) };
-                return pipe.write(buf);
-            }
-            -1
+                pipe.write(buf)
+            } else { -1 }
         }
         Some(FdKind::FileDesc(_)) => {
             match fd_table.get(fd) {
@@ -165,23 +162,22 @@ fn sys_write(fd: i32, buf_addr: usize, size: usize) -> i32 {
 
 fn sys_read(fd: i32, buf_addr: usize, size: usize) -> i32 {
     validate_user_buffer(buf_addr, size);
-
-    if fd == 0 {
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, size) };
-        for b in buf.iter_mut() { *b = crate::devices::input::getc(); }
-        return size as i32;
-    }
     if fd < 0 { return -1; }
 
     let fd_table = super::process::get_fd_table();
     match fd_table.get_kind(fd) {
+        Some(FdKind::Console) => {
+            // Console read = keyboard input
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, size) };
+            for b in buf.iter_mut() { *b = crate::devices::input::getc(); }
+            size as i32
+        }
         Some(FdKind::PipeRead(pipe_id)) => {
             let pipe_id = *pipe_id;
             if let Some(pipe) = crate::pipe::get_pipe(pipe_id) {
                 let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, size) };
-                return pipe.read(buf);
-            }
-            -1
+                pipe.read(buf)
+            } else { -1 }
         }
         Some(FdKind::FileDesc(_)) => {
             match fd_table.get(fd) {
