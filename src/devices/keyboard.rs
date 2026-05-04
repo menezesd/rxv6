@@ -2,6 +2,7 @@
 //!
 //! Ported from Pintos kbd.c. Handles scan code set 1 (default for PS/2),
 //! tracks modifier state, and maps scancodes to ASCII.
+//! Extended keys (arrows, Home, End, etc.) emit ANSI escape sequences.
 
 use crate::arch::idt::{self, IntrFrame};
 use crate::arch::port::Port;
@@ -12,6 +13,8 @@ const DATA_PORT: Port = Port::new(0x60);
 // Modifier state (only accessed from interrupt handler, so safe)
 static mut LEFT_SHIFT: bool = false;
 static mut RIGHT_SHIFT: bool = false;
+static mut LEFT_CTRL: bool = false;
+static mut RIGHT_CTRL: bool = false;
 static mut CAPS_LOCK: bool = false;
 static mut E0_PENDING: bool = false;
 
@@ -91,13 +94,33 @@ static SCANCODE_MAP: [(u8, u8); 128] = {
 // Scan codes for modifier keys
 const SC_LEFT_SHIFT: u8 = 0x2A;
 const SC_RIGHT_SHIFT: u8 = 0x36;
+const SC_LEFT_CTRL: u8 = 0x1D;
 const SC_CAPS_LOCK: u8 = 0x3A;
+
+// Extended (E0) scan codes
+const E0_UP: u8 = 0x48;
+const E0_DOWN: u8 = 0x50;
+const E0_LEFT: u8 = 0x4B;
+const E0_RIGHT: u8 = 0x4D;
+const E0_HOME: u8 = 0x47;
+const E0_END: u8 = 0x4F;
+const E0_PGUP: u8 = 0x49;
+const E0_PGDN: u8 = 0x51;
+const E0_DELETE: u8 = 0x53;
+const E0_INSERT: u8 = 0x52;
 
 /// Initialize the keyboard driver.
 pub fn init() {
     idt::register_ext(1, keyboard_interrupt, "keyboard");
     idt::pic_unmask(1);
     crate::kprintln!("Keyboard initialized (IRQ 1).");
+}
+
+/// Send an ANSI escape sequence into the input buffer.
+fn emit_escape(seq: &[u8]) {
+    for &b in seq {
+        input::putc_raw(b);
+    }
 }
 
 /// Keyboard interrupt handler.
@@ -117,7 +140,13 @@ fn keyboard_interrupt(_frame: &mut IntrFrame) {
         E0_PENDING = false;
 
         // Handle modifier keys
-        if !was_e0 {
+        if was_e0 {
+            // E0 1D = right ctrl
+            if scancode == SC_LEFT_CTRL {
+                RIGHT_CTRL = !is_release;
+                return;
+            }
+        } else {
             match scancode {
                 SC_LEFT_SHIFT => {
                     LEFT_SHIFT = !is_release;
@@ -125,6 +154,10 @@ fn keyboard_interrupt(_frame: &mut IntrFrame) {
                 }
                 SC_RIGHT_SHIFT => {
                     RIGHT_SHIFT = !is_release;
+                    return;
+                }
+                SC_LEFT_CTRL => {
+                    LEFT_CTRL = !is_release;
                     return;
                 }
                 SC_CAPS_LOCK if !is_release => {
@@ -140,8 +173,21 @@ fn keyboard_interrupt(_frame: &mut IntrFrame) {
             return;
         }
 
-        // Ignore extended keys (arrows, etc.) for now
+        // Handle extended keys (arrows, home, end, etc.)
         if was_e0 {
+            match scancode {
+                E0_UP     => emit_escape(b"\x1B[A"),
+                E0_DOWN   => emit_escape(b"\x1B[B"),
+                E0_RIGHT  => emit_escape(b"\x1B[C"),
+                E0_LEFT   => emit_escape(b"\x1B[D"),
+                E0_HOME   => emit_escape(b"\x1B[H"),
+                E0_END    => emit_escape(b"\x1B[F"),
+                E0_PGUP   => emit_escape(b"\x1B[5~"),
+                E0_PGDN   => emit_escape(b"\x1B[6~"),
+                E0_DELETE => emit_escape(b"\x1B[3~"),
+                E0_INSERT => emit_escape(b"\x1B[2~"),
+                _ => {}
+            }
             return;
         }
 
@@ -153,6 +199,16 @@ fn keyboard_interrupt(_frame: &mut IntrFrame) {
             }
 
             let shift = LEFT_SHIFT || RIGHT_SHIFT;
+            let ctrl = LEFT_CTRL || RIGHT_CTRL;
+
+            // Ctrl+key: emit control character
+            if ctrl {
+                let base = unshifted.to_ascii_lowercase();
+                if base >= b'a' && base <= b'z' {
+                    input::putc(base - b'a' + 1); // Ctrl-A=1, Ctrl-C=3, etc.
+                    return;
+                }
+            }
 
             // Determine if we should use shifted variant
             // Caps lock only affects letters (a-z)

@@ -62,6 +62,7 @@ pub extern "C" fn main() -> ! {
 
     // Devices
     devices::keyboard::init();
+    devices::serial::init_input();
     devices::ide::init();
 
     // Virtual memory

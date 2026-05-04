@@ -73,6 +73,8 @@ pub struct Thread {
     pub brk: usize,
     /// Parent thread ID (for wait/fork tracking). 0 = no parent.
     pub parent_tid: i32,
+    /// Set by kill(); process exits on next trap return.
+    pub killed: bool,
     // `magic` MUST be the last field -- stack-overflow sentinel.
     pub magic: u32,
 }
@@ -206,6 +208,7 @@ unsafe fn init_thread(t: *mut Thread, name: &str, priority: i32) {
     t.cwd_sector = crate::filesys::inode::ROOT_DIR_SECTOR;
     t.brk = 0;
     t.parent_tid = 0;
+    t.killed = false;
     t.magic = THREAD_MAGIC;
 }
 
@@ -575,12 +578,43 @@ pub fn restore_priority() {
 /// Returns true if the thread was found.
 pub fn kill_thread(tid: Tid) -> bool {
     let old = idt::intr_disable();
-    let found = all_list().iter().any(|&t| unsafe { (*t).tid == tid });
+    let mut found = false;
+    for &t in all_list().iter() {
+        unsafe {
+            if (*t).tid == tid {
+                (*t).killed = true;
+                found = true;
+                break;
+            }
+        }
+    }
     idt::intr_set_level(old);
-    // In a full implementation, we'd set a "killed" flag and the thread
-    // would check it on next trap return. For now, just report whether
-    // the thread exists.
     found
+}
+
+/// Kill all foreground user processes (Ctrl-C).
+/// Spares init (tid that has parent_tid == 0 and pagedir != null, i.e. the first user process).
+pub fn kill_foreground() {
+    let old = idt::intr_disable();
+    // Find init's tid (first user process with no parent)
+    let mut init_tid: Tid = -1;
+    for &t in all_list().iter() {
+        unsafe {
+            if !(*t).pagedir.is_null() && (*t).parent_tid == 0 {
+                init_tid = (*t).tid;
+                break;
+            }
+        }
+    }
+    // Kill all user processes except init
+    for &t in all_list().iter() {
+        unsafe {
+            if !(*t).pagedir.is_null() && (*t).tid != init_tid {
+                (*t).killed = true;
+            }
+        }
+    }
+    idt::intr_set_level(old);
 }
 
 fn check_thread(t: *mut Thread) {

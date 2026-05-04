@@ -318,6 +318,14 @@ pub extern "C" fn intr_handler(frame: &mut IntrFrame) {
             }
         }
     }
+
+    // If returning to user mode and the process has been killed, exit it.
+    if frame.cs & 3 == 3 {
+        let t = crate::thread::running_thread();
+        if unsafe { (*t).killed } {
+            crate::userprog::process::exit_with_status(-1);
+        }
+    }
 }
 
 // ---- Initialization ----

@@ -32,8 +32,13 @@ const SYS_GETPID: u32 = 18;
 const SYS_SBRK: u32 = 19;
 const SYS_SLEEP: u32 = 20;
 const SYS_UPTIME: u32 = 21;
+const SYS_IOCTL: u32 = 22;
 
 const O_CREATE: i32 = 0x200;
+
+// ioctl requests
+const TIOCRAW: u32 = 0x5401;   // Set raw mode (arg: 0=cooked, 1=raw)
+const TIOCPOLL: u32 = 0x5402;  // Poll: returns 1 if input available, 0 otherwise
 
 /// Register the syscall interrupt handler (int 0x80, DPL=3).
 pub fn init() {
@@ -136,11 +141,7 @@ fn sys_write(fd: i32, buf_addr: usize, size: usize) -> i32 {
     match fd_table.get_kind(fd) {
         Some(FdKind::Console) => {
             let buf = unsafe { core::slice::from_raw_parts(buf_addr as *const u8, size) };
-            if let Ok(s) = core::str::from_utf8(buf) {
-                crate::kprint!("{}", s);
-            } else {
-                for &b in buf { crate::devices::serial::putc(b); }
-            }
+            crate::devices::console_write(buf);
             size as i32
         }
         Some(FdKind::PipeWrite(pipe_id)) => {
@@ -156,6 +157,7 @@ fn sys_write(fd: i32, buf_addr: usize, size: usize) -> i32 {
                 None => -1,
             }
         }
+        Some(FdKind::DevNull) | Some(FdKind::DevZero) => size as i32, // writes silently succeed
         _ => -1,
     }
 }
@@ -167,10 +169,30 @@ fn sys_read(fd: i32, buf_addr: usize, size: usize) -> i32 {
     let fd_table = super::process::get_fd_table();
     match fd_table.get_kind(fd) {
         Some(FdKind::Console) => {
-            // Console read = keyboard input
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, size) };
-            for b in buf.iter_mut() { *b = crate::devices::input::getc(); }
-            size as i32
+            if crate::devices::input::is_raw() {
+                // Raw mode: return whatever is available, byte at a time
+                let mut n = 0;
+                for b in buf.iter_mut() {
+                    let c = crate::devices::input::getc();
+                    if c == 0 { break; } // killed
+                    *b = c;
+                    n += 1;
+                    break; // raw mode: return after first byte
+                }
+                n as i32
+            } else {
+                // Cooked mode: line-buffered, stops at newline
+                let mut n = 0;
+                for b in buf.iter_mut() {
+                    let c = crate::devices::input::getc();
+                    if c == 0x04 { break; } // Ctrl-D = EOF
+                    *b = c;
+                    n += 1;
+                    if c == b'\n' { break; }
+                }
+                n as i32
+            }
         }
         Some(FdKind::PipeRead(pipe_id)) => {
             let pipe_id = *pipe_id;
@@ -184,6 +206,13 @@ fn sys_read(fd: i32, buf_addr: usize, size: usize) -> i32 {
                 Some(file) => bounced_read(file, buf_addr, size),
                 None => -1,
             }
+        }
+        Some(FdKind::DevNull) => 0, // EOF immediately
+        Some(FdKind::DevZero) => {
+            // Fill buffer with zeroes
+            let buf = unsafe { core::slice::from_raw_parts_mut(buf_addr as *mut u8, size) };
+            for b in buf.iter_mut() { *b = 0; }
+            size as i32
         }
         _ => -1,
     }
@@ -353,18 +382,31 @@ fn syscall_handler(frame: &mut IntrFrame) {
             if !is_valid_user_ptr(path_ptr, 1) { exit_process(-1); }
             let path = read_user_string(path_ptr);
 
-            if (flags & O_CREATE) != 0 {
-                if crate::filesys::filesys::open(&path).is_none() {
-                    crate::filesys::filesys::create(&path, 0);
+            // Handle device special paths
+            if path == "dev/null" || path == "/dev/null" {
+                let fd_table = super::process::get_fd_table();
+                frame.eax = fd_table.alloc_dev(FdKind::DevNull) as u32;
+            } else if path == "dev/zero" || path == "/dev/zero" {
+                let fd_table = super::process::get_fd_table();
+                frame.eax = fd_table.alloc_dev(FdKind::DevZero) as u32;
+            } else if path == "dev/console" || path == "/dev/console"
+                   || path == "dev/tty" || path == "/dev/tty" {
+                let fd_table = super::process::get_fd_table();
+                frame.eax = fd_table.alloc_dev(FdKind::Console) as u32;
+            } else {
+                if (flags & O_CREATE) != 0 {
+                    if crate::filesys::filesys::open(&path).is_none() {
+                        crate::filesys::filesys::create(&path, 0);
+                    }
                 }
-            }
 
-            match crate::filesys::filesys::open(&path) {
-                Some(file) => {
-                    let fd_table = super::process::get_fd_table();
-                    frame.eax = fd_table.open(file) as u32;
+                match crate::filesys::filesys::open(&path) {
+                    Some(file) => {
+                        let fd_table = super::process::get_fd_table();
+                        frame.eax = fd_table.open(file) as u32;
+                    }
+                    None => frame.eax = (-1i32) as u32,
                 }
-                None => frame.eax = (-1i32) as u32,
             }
         }
 
@@ -388,28 +430,49 @@ fn syscall_handler(frame: &mut IntrFrame) {
             validate_user_buffer(st_ptr, core::mem::size_of::<Stat>());
 
             let fd_table = super::process::get_fd_table();
-            match fd_table.get(fd) {
-                Some(file) => {
-                    let sector = file.inode_sector;
-                    let is_dir = crate::filesys::inode::is_dir(sector);
-                    let length = crate::filesys::inode::length(sector);
-                    let stat = Stat {
-                        file_type: if is_dir { 1 } else { 2 },
-                        dev: 0,
-                        ino: sector,
-                        nlink: 1,
-                        size: length as u32,
-                    };
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            &stat as *const Stat as *const u8,
-                            st_ptr as *mut u8,
-                            core::mem::size_of::<Stat>(),
-                        );
-                    }
-                    frame.eax = 0;
+            // Check for device fds first
+            let is_dev = matches!(fd_table.get_kind(fd),
+                Some(FdKind::Console) | Some(FdKind::DevNull) | Some(FdKind::DevZero));
+            if is_dev {
+                let stat = Stat {
+                    file_type: 3, // T_DEV
+                    dev: 0,
+                    ino: 0,
+                    nlink: 1,
+                    size: 0,
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &stat as *const Stat as *const u8,
+                        st_ptr as *mut u8,
+                        core::mem::size_of::<Stat>(),
+                    );
                 }
-                None => frame.eax = (-1i32) as u32,
+                frame.eax = 0;
+            } else {
+                match fd_table.get(fd) {
+                    Some(file) => {
+                        let sector = file.inode_sector;
+                        let is_dir = crate::filesys::inode::is_dir(sector);
+                        let length = crate::filesys::inode::length(sector);
+                        let stat = Stat {
+                            file_type: if is_dir { 1 } else { 2 },
+                            dev: 0,
+                            ino: sector,
+                            nlink: 1,
+                            size: length as u32,
+                        };
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                &stat as *const Stat as *const u8,
+                                st_ptr as *mut u8,
+                                core::mem::size_of::<Stat>(),
+                            );
+                        }
+                        frame.eax = 0;
+                    }
+                    None => frame.eax = (-1i32) as u32,
+                }
             }
         }
 
@@ -518,6 +581,29 @@ fn syscall_handler(frame: &mut IntrFrame) {
 
         SYS_UPTIME => {
             frame.eax = crate::devices::timer::ticks() as u32;
+        }
+
+        SYS_IOCTL => {
+            check_args(args, 3);
+            let fd = unsafe { *args.add(1) } as i32;
+            let request = unsafe { *args.add(2) };
+            let arg = unsafe { *args.add(3) };
+            let fd_table = super::process::get_fd_table();
+            match fd_table.get_kind(fd) {
+                Some(FdKind::Console) => {
+                    match request {
+                        TIOCRAW => {
+                            let old = crate::devices::input::set_raw(arg != 0);
+                            frame.eax = old as u32;
+                        }
+                        TIOCPOLL => {
+                            frame.eax = crate::devices::input::has_data() as u32;
+                        }
+                        _ => frame.eax = (-1i32) as u32,
+                    }
+                }
+                _ => frame.eax = (-1i32) as u32,
+            }
         }
 
         _ => {

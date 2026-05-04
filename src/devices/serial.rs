@@ -27,7 +27,10 @@ const LCR_DLAB: u8 = 0x80;  // Divisor Latch Access Bit
 const MCR_OUT2: u8 = 0x08;  // OUT2 (enables interrupts on 16550)
 
 // Line Status Register bits
+const LSR_DR: u8 = 0x01;    // Data Ready (receive)
 const LSR_THRE: u8 = 0x20;  // Transmitter Holding Register Empty
+
+const RBR: Port = Port::new(IO_BASE);     // Receiver Buffer Register (read)
 
 /// Initialize the serial port for polling-mode output.
 /// Configures COM1 to 9600 baud, N-8-1.
@@ -43,6 +46,27 @@ pub fn init() {
     LCR.write_u8(LCR_N81);              // Disable DLAB, set N-8-1
 
     MCR.write_u8(MCR_OUT2);     // Enable interrupt output (needed later)
+}
+
+/// Enable serial port receive interrupts. Must be called after IDT/PIC init.
+pub fn init_input() {
+    FCR.write_u8(0x07);          // Enable and clear FIFOs
+    IER.write_u8(0x01);          // Enable receive data available interrupt
+    crate::arch::idt::register_ext(4, serial_interrupt, "serial");
+    crate::arch::idt::pic_unmask(4);
+
+    // Drain any pending data
+    while (LSR.read_u8() & LSR_DR) != 0 {
+        RBR.read_u8();
+    }
+}
+
+/// Serial port receive interrupt handler.
+fn serial_interrupt(_frame: &mut crate::arch::idt::IntrFrame) {
+    while (LSR.read_u8() & LSR_DR) != 0 {
+        let c = RBR.read_u8();
+        super::input::putc(c);
+    }
 }
 
 /// Write a single byte to the serial port, busy-waiting until ready.

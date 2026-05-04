@@ -150,6 +150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "clear-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "close-bad-fd"
 version = "0.1.0"
 dependencies = [
@@ -1135,6 +1142,13 @@ dependencies = [
 
 [[package]]
 name = "tee"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "tetris"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",

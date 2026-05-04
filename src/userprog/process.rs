@@ -230,12 +230,14 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
 // ---- FD table -------------------------------------------------------------
 
-/// A file descriptor can refer to a regular file, pipe end, or console.
+/// A file descriptor can refer to a regular file, pipe end, console, or device.
 pub enum FdKind {
     FileDesc(Box<File>),
     PipeRead(u32),   // pipe ID, read end
     PipeWrite(u32),  // pipe ID, write end
     Console,         // stdin/stdout/stderr (handled specially in syscall layer)
+    DevNull,         // /dev/null: writes succeed, reads return EOF
+    DevZero,         // /dev/zero: writes succeed, reads return zeroes
 }
 
 /// File descriptor table for a user process.
@@ -281,6 +283,11 @@ impl FdTable {
         self.alloc_fd(FdKind::PipeWrite(pipe_id))
     }
 
+    /// Insert a device fd (Console, DevNull, DevZero) and return the assigned fd.
+    pub fn alloc_dev(&mut self, kind: FdKind) -> i32 {
+        self.alloc_fd(kind)
+    }
+
     /// Get a mutable reference to the File at `fd`, or None if not a file.
     pub fn get(&mut self, fd: i32) -> Option<&mut File> {
         if fd < 0 || (fd as usize) >= self.files.len() { return None; }
@@ -313,7 +320,7 @@ impl FdTable {
                             pipe.close_write();
                         }
                     }
-                    FdKind::Console => {} // nothing to release
+                    FdKind::Console | FdKind::DevNull | FdKind::DevZero => {}
                 }
                 return true;
             }
@@ -337,7 +344,7 @@ impl FdTable {
                             pipe.close_write();
                         }
                     }
-                    FdKind::Console => {}
+                    FdKind::Console | FdKind::DevNull | FdKind::DevZero => {}
                 }
             }
         }
@@ -370,6 +377,8 @@ impl FdTable {
                 let id = *id;
                 self.alloc_fd(FdKind::PipeWrite(id))
             }
+            Some(FdKind::DevNull) => self.alloc_fd(FdKind::DevNull),
+            Some(FdKind::DevZero) => self.alloc_fd(FdKind::DevZero),
             None => -1,
         }
     }
@@ -672,6 +681,8 @@ fn clone_fd_table(_parent_tid: i32) -> *mut FdTable {
             Some(FdKind::PipeRead(id)) => Some(FdKind::PipeRead(*id)),
             Some(FdKind::PipeWrite(id)) => Some(FdKind::PipeWrite(*id)),
             Some(FdKind::Console) => Some(FdKind::Console),
+            Some(FdKind::DevNull) => Some(FdKind::DevNull),
+            Some(FdKind::DevZero) => Some(FdKind::DevZero),
             None => None,
         };
     }

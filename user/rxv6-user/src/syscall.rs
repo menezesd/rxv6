@@ -28,6 +28,7 @@ pub const SYS_GETPID: u32 = 18;
 pub const SYS_SBRK: u32 = 19;
 pub const SYS_SLEEP: u32 = 20;
 pub const SYS_UPTIME: u32 = 21;
+pub const SYS_IOCTL: u32 = 22;
 
 fn syscall0(num: u32) -> i32 {
     let ret: i32;
@@ -203,6 +204,27 @@ pub fn sleep(n: i32) -> i32 {
 /// Return system uptime in timer ticks.
 pub fn uptime() -> i32 {
     syscall0(SYS_UPTIME)
+}
+
+/// ioctl on a file descriptor.
+pub fn ioctl(fd: i32, request: u32, arg: u32) -> i32 {
+    syscall3(SYS_IOCTL, fd as u32, request, arg)
+}
+
+/// ioctl request: set terminal raw mode. arg: 0=cooked, 1=raw.
+/// Returns previous mode.
+pub const TIOCRAW: u32 = 0x5401;
+
+/// Set terminal to raw mode (no echo, no line editing, immediate delivery).
+pub fn set_raw_mode(raw: bool) -> bool {
+    ioctl(0, TIOCRAW, raw as u32) != 0
+}
+
+/// Poll: returns true if console input is available for reading.
+pub const TIOCPOLL: u32 = 0x5402;
+
+pub fn input_ready() -> bool {
+    ioctl(0, TIOCPOLL, 0) != 0
 }
 
 // === File types and stat ===
