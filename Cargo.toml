@@ -1,0 +1,14 @@
+[package]
+name = "rustos"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitflags = "2"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1  # needed: BTreeMap ops overflow 4KB kernel stacks at opt-level=0
+
+[profile.release]
+panic = "abort"

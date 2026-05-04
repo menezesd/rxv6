@@ -1,0 +1,10 @@
+[package]
+name = "multi-recurse"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+rustos-user = { path = "../../rustos-user" }
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

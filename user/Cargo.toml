@@ -1,0 +1,3 @@
+[workspace]
+members = ["rustos-user", "tests/*"]
+resolver = "2"

@@ -1,0 +1,8 @@
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
+
+[build]
+target = "i686-rustos.json"
+rustc = "/Users/dean/.cargo/bin/rustc"

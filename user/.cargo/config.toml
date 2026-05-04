@@ -1,0 +1,11 @@
+[unstable]
+build-std = ["core"]
+build-std-features = ["compiler-builtins-mem"]
+
+[build]
+target = "/Users/dean/rustos/user/i686-rustos-user.json"
+rustc = "/Users/dean/.cargo/bin/rustc"
+
+[target.'cfg(all())']
+rustflags = ["-C", "link-arg=-T/Users/dean/rustos/user/linker.ld"]
+json-target-spec = true

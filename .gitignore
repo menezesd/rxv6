@@ -1,0 +1,5 @@
+/target/
+/user/target/
+/tools/mkdisk/target/
+/tools/mkdisk/.cargo/
+*.img
