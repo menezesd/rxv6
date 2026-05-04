@@ -373,6 +373,8 @@ enum Cmd {
         stdin_file: Option<String>,
         stdout_file: Option<String>,
         append: bool,
+        stderr_file: Option<String>,
+        stderr_to_stdout: bool,
         assignments: Vec<(String, String)>,
     },
     Pipeline(Vec<Cmd>),
@@ -545,14 +547,41 @@ impl Parser {
         let mut stdin_file = None;
         let mut stdout_file = None;
         let mut append = false;
+        let mut stderr_file = None;
+        let mut stderr_to_stdout = false;
         let mut assignments = Vec::new();
 
         loop {
             match self.peek() {
                 Some(Token::Word(w)) => {
                     let w = w.clone();
+                    // Handle 2>file, 2>>file, 2>&1
+                    if w.starts_with("2>") {
+                        self.next();
+                        let rest = &w[2..];
+                        if rest == "&1" {
+                            stderr_to_stdout = true;
+                        } else if rest.starts_with('>') {
+                            // 2>>file (append stderr)
+                            let fname = &rest[1..];
+                            if fname.is_empty() {
+                                if let Some(Token::Word(f)) = self.next() {
+                                    stderr_file = Some(f);
+                                }
+                            } else {
+                                stderr_file = Some(String::from(fname));
+                            }
+                        } else if rest.is_empty() {
+                            if let Some(Token::Word(f)) = self.next() {
+                                stderr_file = Some(f);
+                            }
+                        } else {
+                            stderr_file = Some(String::from(rest));
+                        }
+                        continue;
+                    }
                     // Check for VAR=value assignment (only before any regular args)
-                    if argv.is_empty() && !assignments.is_empty() || argv.is_empty() {
+                    if argv.is_empty() {
                         if let Some(eq_pos) = w.find('=') {
                             let name = &w[..eq_pos];
                             if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
@@ -594,7 +623,7 @@ impl Parser {
             return Cmd::Empty;
         }
 
-        Cmd::Simple { argv, stdin_file, stdout_file, append, assignments }
+        Cmd::Simple { argv, stdin_file, stdout_file, append, stderr_file, stderr_to_stdout, assignments }
     }
 
     fn parse_if(&mut self) -> Cmd {
@@ -699,7 +728,7 @@ impl Parser {
 fn exec_cmd(cmd: &Cmd, vars: &mut Vars) -> i32 {
     match cmd {
         Cmd::Empty => 0,
-        Cmd::Simple { argv, stdin_file, stdout_file, append, assignments } => {
+        Cmd::Simple { argv, stdin_file, stdout_file, append, stderr_file, stderr_to_stdout, assignments } => {
             // Pure assignment (no command)
             if argv.is_empty() {
                 for (k, v) in assignments {
@@ -707,7 +736,7 @@ fn exec_cmd(cmd: &Cmd, vars: &mut Vars) -> i32 {
                 }
                 return 0;
             }
-            exec_simple(argv, stdin_file, stdout_file, *append, assignments, vars)
+            exec_simple(argv, stdin_file, stdout_file, *append, stderr_file, *stderr_to_stdout, assignments, vars)
         }
         Cmd::Pipeline(cmds) => exec_pipeline(cmds, vars),
         Cmd::And(left, right) => {
@@ -805,7 +834,8 @@ fn exec_cmd(cmd: &Cmd, vars: &mut Vars) -> i32 {
 }
 
 fn exec_simple(argv: &[String], stdin_file: &Option<String>, stdout_file: &Option<String>,
-               append: bool, assignments: &[(String, String)], vars: &mut Vars) -> i32 {
+               append: bool, stderr_file: &Option<String>, stderr_to_stdout: bool,
+               assignments: &[(String, String)], vars: &mut Vars) -> i32 {
     let cmd = &argv[0];
 
     // Built-in: cd
@@ -928,14 +958,28 @@ fn exec_simple(argv: &[String], stdin_file: &Option<String>, stdout_file: &Optio
             let len = f.len().min(127);
             buf[..len].copy_from_slice(&f.as_bytes()[..len]);
             let flags = if append {
-                syscall::O_WRONLY | syscall::O_CREATE
+                syscall::O_WRONLY | syscall::O_CREATE | syscall::O_APPEND
             } else {
-                syscall::O_WRONLY | syscall::O_CREATE
+                syscall::O_WRONLY | syscall::O_CREATE | syscall::O_TRUNC
             };
             if syscall::open(buf.as_ptr(), flags) < 0 {
                 println!("sh: cannot open {}", f);
                 syscall::exit(1);
             }
+        }
+        if let Some(f) = stderr_file {
+            syscall::close(2);
+            let mut buf = [0u8; 128];
+            let len = f.len().min(127);
+            buf[..len].copy_from_slice(&f.as_bytes()[..len]);
+            let flags = syscall::O_WRONLY | syscall::O_CREATE | syscall::O_TRUNC;
+            if syscall::open(buf.as_ptr(), flags) < 0 {
+                syscall::exit(1);
+            }
+        }
+        if stderr_to_stdout {
+            syscall::close(2);
+            syscall::dup(1);
         }
 
         // Build argv for exec

@@ -17,7 +17,5 @@ fi
 exec qemu-system-i386 \
     -kernel "$KERNEL" \
     -drive file="$DISK",format=raw,if=ide \
-    -serial stdio \
-    -display none \
     -m 64 \
     "$@"

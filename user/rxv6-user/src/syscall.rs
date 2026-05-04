@@ -287,3 +287,5 @@ pub const O_RDONLY: i32 = 0;
 pub const O_WRONLY: i32 = 1;
 pub const O_RDWR: i32 = 2;
 pub const O_CREATE: i32 = 0x200;
+pub const O_TRUNC: i32 = 0x400;
+pub const O_APPEND: i32 = 0x800;

@@ -41,6 +41,8 @@ const SIG_DFL: u32 = 0;
 const SIG_IGN: u32 = 1;
 
 const O_CREATE: i32 = 0x200;
+const O_TRUNC: i32 = 0x400;
+const O_APPEND: i32 = 0x800;
 
 // ioctl requests
 const TIOCRAW: u32 = 0x5401;   // Set raw mode (arg: 0=cooked, 1=raw)
@@ -421,7 +423,14 @@ fn syscall_handler(frame: &mut IntrFrame) {
                 }
 
                 match crate::filesys::filesys::open(&path) {
-                    Some(file) => {
+                    Some(mut file) => {
+                        if (flags & O_TRUNC) != 0 {
+                            crate::filesys::inode::truncate(file.inode_sector);
+                        }
+                        if (flags & O_APPEND) != 0 {
+                            let len = file.length();
+                            file.seek(len);
+                        }
                         let fd_table = super::process::get_fd_table();
                         frame.eax = fd_table.open(file) as u32;
                     }

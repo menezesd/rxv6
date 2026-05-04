@@ -228,6 +228,16 @@ pub fn remove(sector: BlockSector) {
     }
 }
 
+/// Truncate file to zero length.
+pub fn truncate(sector: BlockSector) {
+    if let Some(inode) = open_inodes().get_mut(&sector) {
+        inode.length = 0;
+    }
+    let mut disk = read_inode_disk(sector);
+    disk.length = 0;
+    write_inode_disk(sector, &disk);
+}
+
 /// Return the length of the inode in bytes.
 pub fn length(sector: BlockSector) -> i32 {
     if let Some(inode) = open_inodes().get(&sector) {

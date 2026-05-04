@@ -7,8 +7,16 @@ USERDIR="$RXDIR/user"
 TOOLSDIR="$RXDIR/tools/mkdisk"
 TARGET=i686-rxv6-user
 
-# User programs to include in the disk image
-PROGS="init sh cat echo ls wc grep mkdir-cmd rm ln-cmd kill-cmd ed cp mv head-cmd tail-cmd sleep-cmd tee sort uniq od date-cmd true-cmd false-cmd chess dc expr cal factor yes-cmd clear-cmd tetris seq tr-cmd rev uname-cmd"
+# User programs: "crate_name:disk_name" (or just "name" if same)
+PROGS=(
+    init sh cat echo ls wc grep ed cp mv tee sort uniq od rev seq
+    mkdir-cmd:mkdir rm ln-cmd:ln kill-cmd:kill head-cmd:head
+    tail-cmd:tail sleep-cmd:sleep date-cmd:date true-cmd:true
+    false-cmd:false clear-cmd:clear tr-cmd:tr uname-cmd:uname
+    chess dc expr cal factor yes-cmd:yes tetris
+    printf-cmd:printf basename-cmd:basename dirname-cmd:dirname
+    xargs-cmd:xargs find-cmd:find
+)
 
 echo "=== Building kernel ==="
 cargo build 2>&1 | grep -v "^warning"
@@ -16,7 +24,10 @@ cargo build 2>&1 | grep -v "^warning"
 echo ""
 echo "=== Building user programs (release, stripped) ==="
 CARGO_PKGS=""
-for p in $PROGS; do CARGO_PKGS="$CARGO_PKGS -p $p"; done
+for entry in "${PROGS[@]}"; do
+    crate="${entry%%:*}"
+    CARGO_PKGS="$CARGO_PKGS -p $crate"
+done
 (cd "$USERDIR" && cargo build --release $CARGO_PKGS 2>&1 | grep -E "Compiling|Finished|error")
 
 echo ""
@@ -32,18 +43,25 @@ if [ -n "$STRIP_CANDIDATE" ]; then
     STRIP_TOOL="$STRIP_CANDIDATE"
 fi
 
-for prog in $PROGS; do
-    src="$USERDIR/target/$TARGET/release/$prog"
+for entry in "${PROGS[@]}"; do
+    crate="${entry%%:*}"
+    if [[ "$entry" == *:* ]]; then
+        disk_name="${entry#*:}"
+    else
+        disk_name="$crate"
+    fi
+    src="$USERDIR/target/$TARGET/release/$crate"
+    dst="$STRIPPED_DIR/$disk_name"
     if [ -f "$src" ]; then
         if [ -n "$STRIP_TOOL" ]; then
-            "$STRIP_TOOL" --strip-all "$src" -O elf32-i386 "$STRIPPED_DIR/$prog" 2>/dev/null || cp "$src" "$STRIPPED_DIR/$prog"
+            "$STRIP_TOOL" --strip-all "$src" -O elf32-i386 "$dst" 2>/dev/null || cp "$src" "$dst"
         else
-            cp "$src" "$STRIPPED_DIR/$prog"
+            cp "$src" "$dst"
         fi
-        size=$(wc -c < "$STRIPPED_DIR/$prog" | tr -d ' ')
-        echo "  $prog: ${size}B"
+        size=$(wc -c < "$dst" | tr -d ' ')
+        echo "  $disk_name: ${size}B"
     else
-        echo "  $prog: NOT FOUND (skipped)"
+        echo "  $disk_name: NOT FOUND (skipped)"
     fi
 done
 
@@ -61,9 +79,15 @@ echo ""
 echo "=== Creating disk image ==="
 # Collect all stripped binaries
 FILES=""
-for prog in $PROGS; do
-    if [ -f "$STRIPPED_DIR/$prog" ]; then
-        FILES="$FILES $STRIPPED_DIR/$prog"
+for entry in "${PROGS[@]}"; do
+    crate="${entry%%:*}"
+    if [[ "$entry" == *:* ]]; then
+        disk_name="${entry#*:}"
+    else
+        disk_name="$crate"
+    fi
+    if [ -f "$STRIPPED_DIR/$disk_name" ]; then
+        FILES="$FILES $STRIPPED_DIR/$disk_name"
     fi
 done
 

@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "basename-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "boundary"
 version = "0.1.0"
 dependencies = [
@@ -346,6 +353,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirname-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "echo"
 version = "0.1.0"
 dependencies = [
@@ -445,6 +459,13 @@ dependencies = [
 
 [[package]]
 name = "filesize"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "find-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -816,6 +837,13 @@ dependencies = [
 
 [[package]]
 name = "persist-write"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "printf-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -1275,6 +1303,13 @@ dependencies = [
 
 [[package]]
 name = "write-zero"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "xargs-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",

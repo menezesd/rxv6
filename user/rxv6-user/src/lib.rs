@@ -10,36 +10,144 @@ extern crate alloc;
 
 pub mod syscall;
 
-// ---- Heap allocator using sbrk() ----
+// ---- Free-list heap allocator using sbrk() ----
+//
+// Classic K&R-style allocator: each block has a header with size.
+// Free blocks are chained in a singly-linked list, sorted by address.
+// alloc() searches free list (first-fit), splits if oversized.
+// dealloc() returns block to free list, coalescing neighbors.
 
 use core::alloc::{GlobalAlloc, Layout};
 
-struct SbrkAllocator;
+/// Block header: sits just before the returned pointer.
+/// `size` is the total block size including the header (in bytes).
+/// `next` points to the next free block (null if end of list or allocated).
+#[repr(C)]
+struct BlockHeader {
+    size: usize,
+    next: *mut BlockHeader,
+}
 
-unsafe impl GlobalAlloc for SbrkAllocator {
+const HEADER_SIZE: usize = core::mem::size_of::<BlockHeader>();
+// Minimum allocation unit: header + 8 bytes (ensures alignment)
+const MIN_BLOCK: usize = HEADER_SIZE + 8;
+
+struct FreeListAllocator {
+    head: core::cell::UnsafeCell<*mut BlockHeader>,
+}
+
+unsafe impl Sync for FreeListAllocator {}
+
+unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let size = layout.size();
-        let align = layout.align();
-        // sbrk to get memory; over-allocate to handle alignment
-        let total = size + align + 4; // 4 bytes for storing allocated size
-        let base = syscall::sbrk(total as i32);
-        if base < 0 { return core::ptr::null_mut(); }
-        let base = base as usize;
-        // Align the returned pointer (leave room for size header)
-        let aligned = (base + 4 + align - 1) & !(align - 1);
-        // Store the allocation size just before the aligned pointer
-        *((aligned - 4) as *mut u32) = total as u32;
-        aligned as *mut u8
+        let align = layout.align().max(HEADER_SIZE); // at least header-aligned
+        // Total size: header + padding for alignment + payload
+        let payload = layout.size();
+        let total = (HEADER_SIZE + align - 1 + payload).max(MIN_BLOCK);
+        // Round up to HEADER_SIZE alignment
+        let total = (total + HEADER_SIZE - 1) & !(HEADER_SIZE - 1);
+
+        let head = &mut *self.head.get();
+
+        // First-fit search through free list
+        let mut prev: *mut BlockHeader = core::ptr::null_mut();
+        let mut cur = *head;
+        while !cur.is_null() {
+            if (*cur).size >= total {
+                // Found a fit. Split if remainder is large enough.
+                let remainder = (*cur).size - total;
+                if remainder >= MIN_BLOCK {
+                    // Split: shrink current block, carve new block from the end
+                    (*cur).size = remainder;
+                    let new_block = (cur as *mut u8).add(remainder) as *mut BlockHeader;
+                    (*new_block).size = total;
+                    (*new_block).next = core::ptr::null_mut();
+                    return (new_block as *mut u8).add(HEADER_SIZE);
+                } else {
+                    // Use entire block
+                    if prev.is_null() {
+                        *head = (*cur).next;
+                    } else {
+                        (*prev).next = (*cur).next;
+                    }
+                    (*cur).next = core::ptr::null_mut();
+                    return (cur as *mut u8).add(HEADER_SIZE);
+                }
+            }
+            prev = cur;
+            cur = (*cur).next;
+        }
+
+        // No free block found — grow heap with sbrk
+        let grow = total.max(4096); // grow at least one page
+        let base = syscall::sbrk(grow as i32);
+        if base < 0 {
+            return core::ptr::null_mut();
+        }
+        let block = base as usize as *mut BlockHeader;
+        (*block).size = grow;
+        (*block).next = core::ptr::null_mut();
+
+        if grow > total && grow - total >= MIN_BLOCK {
+            // Put remainder on free list
+            let remainder_block = (block as *mut u8).add(total) as *mut BlockHeader;
+            (*remainder_block).size = grow - total;
+            (*remainder_block).next = core::ptr::null_mut();
+            free_list_insert(head, remainder_block);
+
+            (*block).size = total;
+        }
+
+        (block as *mut u8).add(HEADER_SIZE)
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Simple bump allocator: dealloc is a no-op.
-        // Memory is reclaimed when the process exits.
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        if ptr.is_null() { return; }
+        let block = ptr.sub(HEADER_SIZE) as *mut BlockHeader;
+        let head = &mut *self.head.get();
+        free_list_insert(head, block);
+    }
+}
+
+/// Insert a block into the free list in address order, coalescing neighbors.
+unsafe fn free_list_insert(head: &mut *mut BlockHeader, block: *mut BlockHeader) {
+    let block_addr = block as usize;
+    let block_end = block_addr + (*block).size;
+
+    // Find insertion point (sorted by address)
+    let mut prev: *mut BlockHeader = core::ptr::null_mut();
+    let mut cur = *head;
+    while !cur.is_null() && (cur as usize) < block_addr {
+        prev = cur;
+        cur = (*cur).next;
+    }
+
+    // Try to coalesce with next block
+    if !cur.is_null() && block_end == cur as usize {
+        (*block).size += (*cur).size;
+        (*block).next = (*cur).next;
+    } else {
+        (*block).next = cur;
+    }
+
+    // Try to coalesce with previous block
+    if !prev.is_null() {
+        let prev_end = prev as usize + (*prev).size;
+        if prev_end == block_addr {
+            (*prev).size += (*block).size;
+            (*prev).next = (*block).next;
+        } else {
+            (*prev).next = block;
+        }
+    } else {
+        *head = block;
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: SbrkAllocator = SbrkAllocator;
+static ALLOCATOR: FreeListAllocator = FreeListAllocator {
+    head: core::cell::UnsafeCell::new(core::ptr::null_mut()),
+};
 
 #[alloc_error_handler]
 fn alloc_error(_layout: Layout) -> ! {
