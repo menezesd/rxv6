@@ -29,6 +29,21 @@ pub const SYS_SBRK: u32 = 19;
 pub const SYS_SLEEP: u32 = 20;
 pub const SYS_UPTIME: u32 = 21;
 pub const SYS_IOCTL: u32 = 22;
+pub const SYS_SIGNAL: u32 = 23;
+pub const SYS_SETPGID: u32 = 24;
+pub const SYS_GETPGID: u32 = 25;
+
+// Signal numbers
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
+pub const SIGKILL: u32 = 9;
+pub const SIGPIPE: u32 = 13;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+
+pub const SIG_DFL: u32 = 0;
+pub const SIG_IGN: u32 = 1;
 
 fn syscall0(num: u32) -> i32 {
     let ret: i32;
@@ -136,9 +151,28 @@ pub fn close(fd: i32) -> i32 {
     syscall1(SYS_CLOSE, fd as u32)
 }
 
-/// Kill process (SIGKILL semantics only).
-pub fn kill(pid: i32) -> i32 {
-    syscall1(SYS_KILL, pid as u32)
+/// Send a signal to a process or process group.
+/// pid > 0: send to that process
+/// pid == 0: send to own process group
+/// pid < -1: send to process group |pid|
+/// sig == 0: use SIGKILL for backwards compatibility
+pub fn kill(pid: i32, sig: u32) -> i32 {
+    syscall2(SYS_KILL, pid as u32, sig)
+}
+
+/// Set signal disposition. Returns previous disposition.
+pub fn signal(sig: u32, handler: u32) -> i32 {
+    syscall2(SYS_SIGNAL, sig, handler)
+}
+
+/// Set process group ID.
+pub fn setpgid(pid: i32, pgid: i32) -> i32 {
+    syscall2(SYS_SETPGID, pid as u32, pgid as u32)
+}
+
+/// Get process group ID.
+pub fn getpgid(pid: i32) -> i32 {
+    syscall1(SYS_GETPGID, pid as u32)
 }
 
 /// Replace current process with new program. argv is null-terminated array.

@@ -8,7 +8,7 @@ TOOLSDIR="$RXDIR/tools/mkdisk"
 TARGET=i686-rxv6-user
 
 # User programs to include in the disk image
-PROGS="init sh cat echo ls wc grep mkdir-cmd rm ln-cmd kill-cmd ed cp mv head-cmd tail-cmd sleep-cmd tee sort uniq od date-cmd true-cmd false-cmd chess dc expr cal factor yes-cmd clear-cmd tetris"
+PROGS="init sh cat echo ls wc grep mkdir-cmd rm ln-cmd kill-cmd ed cp mv head-cmd tail-cmd sleep-cmd tee sort uniq od date-cmd true-cmd false-cmd chess dc expr cal factor yes-cmd clear-cmd tetris seq tr-cmd rev uname-cmd"
 
 echo "=== Building kernel ==="
 cargo build 2>&1 | grep -v "^warning"

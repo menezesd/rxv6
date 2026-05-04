@@ -75,6 +75,12 @@ pub struct Thread {
     pub parent_tid: i32,
     /// Set by kill(); process exits on next trap return.
     pub killed: bool,
+    /// Process group ID. Defaults to own tid. Inherited by fork.
+    pub pgid: i32,
+    /// Bitmask of pending signals (bits 1-31).
+    pub sig_pending: u32,
+    /// Signal dispositions: 0=SIG_DFL, 1=SIG_IGN (per-process, inherited by fork, reset by exec).
+    pub sig_ignore: u32,
     // `magic` MUST be the last field -- stack-overflow sentinel.
     pub magic: u32,
 }
@@ -209,6 +215,9 @@ unsafe fn init_thread(t: *mut Thread, name: &str, priority: i32) {
     t.brk = 0;
     t.parent_tid = 0;
     t.killed = false;
+    t.pgid = t.tid; // default: own process group
+    t.sig_pending = 0;
+    t.sig_ignore = 0;
     t.magic = THREAD_MAGIC;
 }
 
@@ -574,15 +583,26 @@ pub fn restore_priority() {
     }
 }
 
-/// Mark a thread for termination by TID (UNIX kill semantics).
-/// Returns true if the thread was found.
-pub fn kill_thread(tid: Tid) -> bool {
+// ---- Signal constants (POSIX subset) ----
+
+pub const SIGHUP: u32 = 1;
+pub const SIGINT: u32 = 2;
+pub const SIGQUIT: u32 = 3;
+pub const SIGKILL: u32 = 9;
+pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
+pub const SIGTERM: u32 = 15;
+pub const SIGCHLD: u32 = 17;
+
+/// Send a signal to a specific thread. Returns true if found.
+pub fn send_signal(tid: Tid, sig: u32) -> bool {
+    if sig == 0 || sig > 31 { return false; }
     let old = idt::intr_disable();
     let mut found = false;
     for &t in all_list().iter() {
         unsafe {
-            if (*t).tid == tid {
-                (*t).killed = true;
+            if (*t).tid == tid && !(*t).pagedir.is_null() {
+                deliver_signal(t, sig);
                 found = true;
                 break;
             }
@@ -592,29 +612,120 @@ pub fn kill_thread(tid: Tid) -> bool {
     found
 }
 
-/// Kill all foreground user processes (Ctrl-C).
-/// Spares init (tid that has parent_tid == 0 and pagedir != null, i.e. the first user process).
-pub fn kill_foreground() {
+/// Send a signal to all processes in a process group.
+pub fn send_signal_pgid(pgid: Tid, sig: u32) {
+    if sig == 0 || sig > 31 { return; }
     let old = idt::intr_disable();
-    // Find init's tid (first user process with no parent)
-    let mut init_tid: Tid = -1;
     for &t in all_list().iter() {
         unsafe {
-            if !(*t).pagedir.is_null() && (*t).parent_tid == 0 {
-                init_tid = (*t).tid;
-                break;
-            }
-        }
-    }
-    // Kill all user processes except init
-    for &t in all_list().iter() {
-        unsafe {
-            if !(*t).pagedir.is_null() && (*t).tid != init_tid {
-                (*t).killed = true;
+            if !(*t).pagedir.is_null() && (*t).pgid == pgid {
+                deliver_signal(t, sig);
             }
         }
     }
     idt::intr_set_level(old);
+}
+
+/// Internal: deliver a signal to a thread.
+unsafe fn deliver_signal(t: *mut Thread, sig: u32) {
+    let mask = 1u32 << sig;
+    // SIGKILL and SIGSTOP can never be ignored
+    if sig == SIGKILL {
+        (*t).killed = true;
+        return;
+    }
+    if (*t).sig_ignore & mask != 0 {
+        return; // ignored
+    }
+    // Default action for most signals is to kill
+    match sig {
+        SIGCHLD => {} // default: ignore
+        _ => (*t).killed = true,
+    }
+}
+
+/// Check and handle pending signals for current thread.
+/// Called on trap return to usermode.
+pub fn check_signals() {
+    let t = running_thread();
+    unsafe {
+        if (*t).killed {
+            crate::userprog::process::exit_with_status(-1);
+        }
+    }
+}
+
+/// Mark a thread for termination by TID (UNIX kill semantics).
+/// Returns true if the thread was found.
+pub fn kill_thread(tid: Tid) -> bool {
+    send_signal(tid, SIGKILL)
+}
+
+/// Get the foreground process group ID.
+/// For simplicity: it's the pgid of the most recently created user process
+/// (the shell's child). If no children, returns the shell's pgid.
+pub fn foreground_pgid() -> Tid {
+    let old = idt::intr_disable();
+    let mut fg_pgid: Tid = -1;
+    let mut max_tid: Tid = -1;
+    let mut init_tid: Tid = -1;
+
+    for &t in all_list().iter() {
+        unsafe {
+            if !(*t).pagedir.is_null() {
+                if (*t).parent_tid == 0 {
+                    init_tid = (*t).tid;
+                }
+                if (*t).tid > max_tid && (*t).tid != init_tid {
+                    max_tid = (*t).tid;
+                    fg_pgid = (*t).pgid;
+                }
+            }
+        }
+    }
+    idt::intr_set_level(old);
+    if fg_pgid < 0 { 0 } else { fg_pgid }
+}
+
+/// Send SIGINT to the foreground process group (Ctrl-C).
+pub fn kill_foreground() {
+    let pgid = foreground_pgid();
+    if pgid > 0 {
+        send_signal_pgid(pgid, SIGINT);
+    }
+}
+
+/// Set process group for a thread.
+pub fn set_pgid(tid: Tid, pgid: Tid) -> bool {
+    let old = idt::intr_disable();
+    let mut found = false;
+    for &t in all_list().iter() {
+        unsafe {
+            if (*t).tid == tid {
+                (*t).pgid = if pgid == 0 { tid } else { pgid };
+                found = true;
+                break;
+            }
+        }
+    }
+    idt::intr_set_level(old);
+    found
+}
+
+/// Get process group for a thread.
+pub fn get_pgid(tid: Tid) -> Tid {
+    let old = idt::intr_disable();
+    let mut pgid: Tid = -1;
+    for &t in all_list().iter() {
+        unsafe {
+            if (*t).tid == tid {
+                pgid = (*t).pgid;
+                break;
+            }
+        }
+    }
+    idt::intr_set_level(old);
+    pgid
 }
 
 fn check_thread(t: *mut Thread) {

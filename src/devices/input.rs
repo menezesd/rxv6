@@ -85,12 +85,18 @@ pub fn putc(c: u8) {
         match c {
             CTRL_C => {
                 crate::kprint!("^C\n");
-                crate::thread::kill_foreground();
+                let pgid = crate::thread::foreground_pgid();
+                if pgid > 0 {
+                    crate::thread::send_signal_pgid(pgid, crate::thread::SIGINT);
+                }
                 INPUT.e = INPUT.w;
             }
             CTRL_BACKSLASH => {
                 crate::kprint!("^\\\n");
-                crate::thread::kill_foreground();
+                let pgid = crate::thread::foreground_pgid();
+                if pgid > 0 {
+                    crate::thread::send_signal_pgid(pgid, crate::thread::SIGQUIT);
+                }
                 INPUT.e = INPUT.w;
             }
             CTRL_Z => {

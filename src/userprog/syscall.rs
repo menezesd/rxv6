@@ -33,6 +33,12 @@ const SYS_SBRK: u32 = 19;
 const SYS_SLEEP: u32 = 20;
 const SYS_UPTIME: u32 = 21;
 const SYS_IOCTL: u32 = 22;
+const SYS_SIGNAL: u32 = 23;
+const SYS_SETPGID: u32 = 24;
+const SYS_GETPGID: u32 = 25;
+
+const SIG_DFL: u32 = 0;
+const SIG_IGN: u32 = 1;
 
 const O_CREATE: i32 = 0x200;
 
@@ -350,13 +356,27 @@ fn syscall_handler(frame: &mut IntrFrame) {
         }
 
         SYS_KILL => {
-            check_args(args, 1);
+            check_args(args, 2);
             let pid = unsafe { *args.add(1) } as i32;
-            // Mark the target thread for termination.
-            // In xv6, kill just sets p->killed; the process exits on next trap return.
-            // Simplified: we just check if the thread exists.
-            let found = crate::thread::kill_thread(pid);
-            frame.eax = if found { 0u32 } else { (-1i32) as u32 };
+            let sig = unsafe { *args.add(2) };
+            let sig = if sig == 0 { crate::thread::SIGKILL } else { sig };
+            if pid > 0 {
+                // Send signal to specific process
+                let found = crate::thread::send_signal(pid, sig);
+                frame.eax = if found { 0u32 } else { (-1i32) as u32 };
+            } else if pid == 0 {
+                // Send signal to own process group
+                let pgid = unsafe { (*crate::thread::running_thread()).pgid };
+                crate::thread::send_signal_pgid(pgid, sig);
+                frame.eax = 0;
+            } else if pid == -1 {
+                // Send to all processes (except init) — not impl, just return -1
+                frame.eax = (-1i32) as u32;
+            } else {
+                // Negative pid: send to process group |pid|
+                crate::thread::send_signal_pgid(-pid, sig);
+                frame.eax = 0;
+            }
         }
 
         SYS_EXEC => {
@@ -604,6 +624,51 @@ fn syscall_handler(frame: &mut IntrFrame) {
                 }
                 _ => frame.eax = (-1i32) as u32,
             }
+        }
+
+        SYS_SIGNAL => {
+            check_args(args, 2);
+            let sig = unsafe { *args.add(1) };
+            let handler = unsafe { *args.add(2) };
+            if sig == 0 || sig > 31 || sig == crate::thread::SIGKILL {
+                frame.eax = (-1i32) as u32;
+            } else {
+                let t = crate::thread::running_thread();
+                let mask = 1u32 << sig;
+                unsafe {
+                    let old = if (*t).sig_ignore & mask != 0 { SIG_IGN } else { SIG_DFL };
+                    if handler == SIG_IGN {
+                        (*t).sig_ignore |= mask;
+                    } else {
+                        (*t).sig_ignore &= !mask;
+                    }
+                    frame.eax = old;
+                }
+            }
+        }
+
+        SYS_SETPGID => {
+            check_args(args, 2);
+            let pid = unsafe { *args.add(1) } as i32;
+            let pgid = unsafe { *args.add(2) } as i32;
+            let target = if pid == 0 {
+                unsafe { (*crate::thread::running_thread()).tid }
+            } else {
+                pid
+            };
+            let found = crate::thread::set_pgid(target, pgid);
+            frame.eax = if found { 0u32 } else { (-1i32) as u32 };
+        }
+
+        SYS_GETPGID => {
+            check_args(args, 1);
+            let pid = unsafe { *args.add(1) } as i32;
+            let target = if pid == 0 {
+                unsafe { (*crate::thread::running_thread()).tid }
+            } else {
+                pid
+            };
+            frame.eax = crate::thread::get_pgid(target) as u32;
         }
 
         _ => {

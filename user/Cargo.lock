@@ -948,6 +948,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rev"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "rm"
 version = "0.1.0"
 dependencies = [
@@ -1016,6 +1023,13 @@ dependencies = [
 
 [[package]]
 name = "seek-tell"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "seq"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -1155,7 +1169,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tr-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "true-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "uname-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",

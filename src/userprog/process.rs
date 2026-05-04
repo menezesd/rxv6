@@ -497,11 +497,16 @@ pub fn fork(parent_frame: &IntrFrame) -> i32 {
         set_spt(child_tid, child_spt);
     }
 
-    // 11. Set parent_tid on the child thread
+    // 11. Set parent_tid and inherit pgid/sig_ignore on the child thread
     unsafe {
+        let parent_t = crate::thread::running_thread();
+        let parent_pgid = (*parent_t).pgid;
+        let parent_sig_ignore = (*parent_t).sig_ignore;
         for &t in crate::thread::all_list_pub().iter() {
             if (*t).tid == child_tid {
                 (*t).parent_tid = parent_tid;
+                (*t).pgid = parent_pgid;
+                (*t).sig_ignore = parent_sig_ignore;
                 break;
             }
         }
@@ -749,8 +754,11 @@ pub fn sys_exec(path: &str, argv_addr: usize, frame: &mut IntrFrame) -> i32 {
                 pagedir::destroy(old_pd);
             }
 
-            // Reset brk
-            unsafe { (*t).brk = 0; }
+            // Reset brk and signal dispositions (POSIX: exec resets to SIG_DFL)
+            unsafe {
+                (*t).brk = 0;
+                (*t).sig_ignore = 0;
+            }
 
             // Update thread name
             let prog_name = path.split('/').last().unwrap_or(path);

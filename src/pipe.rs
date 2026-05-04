@@ -38,7 +38,7 @@ impl Pipe {
     }
 
     /// Write up to `n` bytes from `data` into the pipe.
-    /// Blocks if pipe is full. Returns bytes written, or -1 if read end closed.
+    /// Blocks if pipe is full. Returns bytes written, or -1 if read end closed (SIGPIPE).
     pub fn write(&mut self, data: &[u8]) -> i32 {
         self.lock.acquire();
         let mut written = 0usize;
@@ -47,6 +47,10 @@ impl Pipe {
             while self.nwrite == self.nread + PIPE_SIZE {
                 if !self.read_open {
                     self.lock.release();
+                    // Send SIGPIPE to current process
+                    let t = crate::thread::running_thread();
+                    let tid = unsafe { (*t).tid };
+                    crate::thread::send_signal(tid, crate::thread::SIGPIPE);
                     return -1;
                 }
                 self.not_full.wait(&mut self.lock);
@@ -54,7 +58,6 @@ impl Pipe {
             self.buf[self.nwrite % PIPE_SIZE] = byte;
             self.nwrite += 1;
             written += 1;
-            // Wake readers after each byte group
         }
         self.not_empty.signal(&self.lock);
         self.lock.release();

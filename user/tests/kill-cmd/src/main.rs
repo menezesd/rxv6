@@ -9,13 +9,21 @@ use rxv6_user::println;
 #[no_mangle]
 pub extern "C" fn rust_main(argc: i32, argv: *const *const u8) -> i32 {
     if argc < 2 {
-        println!("usage: kill pid ...");
+        println!("usage: kill [-signal] pid ...");
         return 1;
     }
-    for i in 1..argc {
+    let mut sig = syscall::SIGTERM;
+    let mut start = 1;
+    // Check for -signal flag
+    let first = unsafe { rxv6_user::cstr_to_str(*argv.add(1)) };
+    if first.as_bytes().first() == Some(&b'-') && first.len() > 1 {
+        sig = atoi(&first[1..]) as u32;
+        start = 2;
+    }
+    for i in start..argc {
         let arg = unsafe { rxv6_user::cstr_to_str(*argv.add(i as usize)) };
         let pid = atoi(arg);
-        if syscall::kill(pid) < 0 {
+        if syscall::kill(pid, sig) < 0 {
             println!("kill: failed for pid {}", pid);
         }
     }
