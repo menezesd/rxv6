@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cal"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "cat"
 version = "0.1.0"
 dependencies = [
@@ -248,6 +255,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "dir-empty-name"
 version = "0.1.0"
 dependencies = [
@@ -396,6 +410,20 @@ dependencies = [
 
 [[package]]
 name = "exit"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "expr"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "factor"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -1205,6 +1233,13 @@ dependencies = [
 
 [[package]]
 name = "write-zero"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "yes-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
