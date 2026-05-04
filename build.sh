@@ -8,14 +8,16 @@ TOOLSDIR="$RXDIR/tools/mkdisk"
 TARGET=i686-rxv6-user
 
 # User programs to include in the disk image
-PROGS="init sh cat echo ls wc grep mkdir-cmd rm ln-cmd kill-cmd"
+PROGS="init sh cat echo ls wc grep mkdir-cmd rm ln-cmd kill-cmd ed cp mv head-cmd tail-cmd sleep-cmd tee sort uniq od date-cmd true-cmd false-cmd"
 
 echo "=== Building kernel ==="
 cargo build 2>&1 | grep -v "^warning"
 
 echo ""
 echo "=== Building user programs (release, stripped) ==="
-(cd "$USERDIR" && cargo build --release -p init -p sh -p cat -p echo -p ls -p wc -p grep -p mkdir-cmd -p rm -p ln-cmd -p kill-cmd 2>&1 | grep -E "Compiling|Finished|error")
+CARGO_PKGS=""
+for p in $PROGS; do CARGO_PKGS="$CARGO_PKGS -p $p"; done
+(cd "$USERDIR" && cargo build --release $CARGO_PKGS 2>&1 | grep -E "Compiling|Finished|error")
 
 echo ""
 echo "=== Stripping user binaries ==="

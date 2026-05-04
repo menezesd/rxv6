@@ -171,6 +171,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cp"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "create-bad-ptr"
 version = "0.1.0"
 dependencies = [
@@ -221,6 +228,13 @@ dependencies = [
 
 [[package]]
 name = "create-write-read"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "date-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -311,6 +325,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "exec-arg"
 version = "0.1.0"
 dependencies = [
@@ -368,6 +389,13 @@ dependencies = [
 
 [[package]]
 name = "exit"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "false-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -452,6 +480,13 @@ dependencies = [
 
 [[package]]
 name = "halt"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "head-cmd"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -613,6 +648,20 @@ dependencies = [
 
 [[package]]
 name = "multi-recurse"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "mv"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "od"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
@@ -966,6 +1015,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sleep-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "sm-create"
 version = "0.1.0"
 dependencies = [
@@ -1001,6 +1057,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sort"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "sparse-file"
 version = "0.1.0"
 dependencies = [
@@ -1023,6 +1086,34 @@ dependencies = [
 
 [[package]]
 name = "syn-write"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "tail-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "tee"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "true-cmd"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
+name = "uniq"
 version = "0.1.0"
 dependencies = [
  "rxv6-user",
