@@ -249,8 +249,8 @@ fn syscall_handler(frame: &mut IntrFrame) {
 
     match syscall_num {
         SYS_FORK => {
-            // TODO: implement fork() - duplicate address space and trapframe
-            frame.eax = (-1i32) as u32;
+            let child_tid = super::process::fork(frame);
+            frame.eax = child_tid as u32; // parent gets child pid (or -1)
         }
 
         SYS_EXIT => {

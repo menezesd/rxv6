@@ -83,6 +83,11 @@ impl SupplementaryPageTable {
         self.entries.remove(&page)
     }
 
+    /// Iterate over all entries (used by fork to clone SPT).
+    pub fn iter(&self) -> impl Iterator<Item = &SptEntry> {
+        self.entries.values().map(|e| &**e)
+    }
+
     /// Destroy all entries, freeing any swap slots held by evicted pages.
     pub fn destroy(&mut self) {
         for (_vaddr, entry) in self.entries.iter() {

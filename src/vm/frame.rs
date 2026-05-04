@@ -257,6 +257,20 @@ pub fn pin_upage(tid: i32, upage: usize) {
     }
 }
 
+/// Replace placeholder owner_tid with real_tid for all matching frames.
+/// Used by fork() to fix up frame ownership after the child tid is known.
+pub fn fix_owner_tid(placeholder: i32, real_tid: i32) {
+    unsafe {
+        if let Some(ref mut ft) = FRAME_TABLE {
+            for entry in ft.iter_mut() {
+                if entry.owner_tid == placeholder {
+                    entry.owner_tid = real_tid;
+                }
+            }
+        }
+    }
+}
+
 /// Unpin the frame mapped to user page `upage` for thread `tid`.
 pub fn unpin_upage(tid: i32, upage: usize) {
     unsafe {

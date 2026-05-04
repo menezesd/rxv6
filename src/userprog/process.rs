@@ -330,11 +330,281 @@ fn current_pagedir() -> *mut u32 {
     unsafe { (*t).pagedir }
 }
 
-// ---- Embedded ELF lookup ---------------------------------------------------
+// ---- Fork -----------------------------------------------------------------
 
-// Look up an embedded test ELF by program name.
-// Returns Some(elf_data) if found, None otherwise.
-// Embedded ELF lookup removed -- all programs are loaded from the filesystem.
+use crate::arch::idt::IntrFrame;
+
+/// Data passed to the fork child thread through the aux pointer.
+struct ForkArgs {
+    /// Copy of parent's trapframe (child returns here with eax=0).
+    frame: IntrFrame,
+    /// Child's new page directory.
+    child_pd: *mut u32,
+    /// Child's FD table.
+    child_fdt: *mut FdTable,
+}
+
+unsafe impl Send for ForkArgs {}
+
+/// Fork the current process. Called from the syscall handler.
+///
+/// Returns child TID to parent (>0), or -1 on failure.
+/// The child will return 0 in eax when it resumes.
+pub fn fork(parent_frame: &IntrFrame) -> i32 {
+    let parent_t = thread::running_thread();
+    let parent_tid = unsafe { (*parent_t).tid };
+    let parent_pd = unsafe { (*parent_t).pagedir };
+    if parent_pd.is_null() {
+        return -1; // kernel threads can't fork
+    }
+
+    // 1. Create child page directory with kernel mappings
+    let child_pd = pagedir::create();
+    if child_pd.is_null() {
+        return -1;
+    }
+
+    // 2. Deep-copy all user pages from parent to child
+    let child_tid_placeholder = -1i32; // we don't have child tid yet, use placeholder
+    if !copy_user_pages(parent_pd, child_pd, parent_tid, child_tid_placeholder) {
+        pagedir::destroy(child_pd);
+        return -1;
+    }
+
+    // 3. Clone the parent's SPT
+    let parent_spt_ptr = get_spt(parent_tid);
+    let child_spt = if !parent_spt_ptr.is_null() {
+        let parent_spt = unsafe { &*parent_spt_ptr };
+        let cloned = clone_spt(parent_spt);
+        Box::into_raw(Box::new(cloned))
+    } else {
+        core::ptr::null_mut()
+    };
+
+    // 4. Clone the parent's FD table
+    let child_fdt = clone_fd_table(parent_tid);
+
+    // 5. Get executable sector for deny-write tracking
+    let exec_sector = process_states().get(&parent_tid)
+        .and_then(|ps| ps.executable_sector);
+
+    // 6. Copy the parent's trapframe, set child's eax to 0
+    let mut child_frame = unsafe { core::ptr::read(parent_frame) };
+    child_frame.eax = 0; // fork returns 0 in child
+
+    // 7. Package fork args for the child thread
+    let fork_args = Box::new(ForkArgs {
+        frame: child_frame,
+        child_pd,
+        child_fdt,
+    });
+    let args_ptr = Box::into_raw(fork_args) as *mut u8;
+
+    // 8. Create the child thread
+    let parent_name = thread::current_name();
+    let child_tid = thread::create(parent_name, thread::get_priority(), fork_child_entry, args_ptr);
+
+    if child_tid == thread::TID_ERROR {
+        // Clean up on failure
+        unsafe { drop(Box::from_raw(args_ptr as *mut ForkArgs)); }
+        if !child_spt.is_null() {
+            unsafe {
+                let mut spt = Box::from_raw(child_spt);
+                spt.destroy();
+            }
+        }
+        pagedir::destroy(child_pd);
+        return -1;
+    }
+
+    // 9. Fix up frame table entries: replace placeholder tid with real child tid
+    fix_frame_owner(child_tid_placeholder, child_tid);
+
+    // 10. Register child's SPT
+    if !child_spt.is_null() {
+        set_spt(child_tid, child_spt);
+    }
+
+    // 11. Create process state for wait/exit synchronization
+    let ps = Box::new(ProcessState {
+        tid: child_tid,
+        exit_status: -1,
+        exited: false,
+        waited: false,
+        wait_sema: Semaphore::new(0),
+        load_sema: Semaphore::new(1), // already "loaded" (forked)
+        load_success: true,
+        executable_sector: exec_sector,
+    });
+    process_states().insert(child_tid, ps);
+
+    // If parent has an executable, open it again for the child (bump inode refcount)
+    if let Some(sector) = exec_sector {
+        crate::filesys::inode::open(sector);
+        crate::filesys::inode::deny_write(sector);
+    }
+
+    child_tid
+}
+
+/// Entry point for a forked child thread.
+///
+/// Receives the ForkArgs, installs the child's page directory and FD table,
+/// then jumps to user mode using the copied trapframe.
+fn fork_child_entry(aux: *mut u8) {
+    let args = unsafe { *Box::from_raw(aux as *mut ForkArgs) };
+    let t = thread::running_thread();
+
+    // Install the child's page directory and FD table
+    unsafe {
+        (*t).pagedir = args.child_pd;
+        (*t).fd_table = args.child_fdt;
+    }
+
+    // Activate the child's address space
+    pagedir::activate(args.child_pd);
+
+    // Copy the IntrFrame onto the kernel stack and jump to intr_exit.
+    // intr_exit expects ESP to point to the start of the frame (edi field).
+    // We can't use inline asm with 15+ registers on x86-32, so we
+    // copy the frame as a block using pointer arithmetic.
+    // Copy the IntrFrame onto the kernel stack and jump to intr_exit.
+    // intr_exit expects ESP to point to the start of the frame (edi field).
+    let frame_size = core::mem::size_of::<IntrFrame>();
+    let frame_src = &args.frame as *const IntrFrame as *const u8;
+    unsafe {
+        // Reserve space on the stack for the frame, copy it, then jump.
+        let frame_dst: *mut u8;
+        core::arch::asm!(
+            "sub esp, {size}",
+            "mov {out}, esp",
+            size = in(reg) frame_size,
+            out = out(reg) frame_dst,
+        );
+        core::ptr::copy_nonoverlapping(frame_src, frame_dst, frame_size);
+        core::arch::asm!(
+            "jmp intr_exit",
+            options(noreturn)
+        );
+    }
+}
+
+/// Deep-copy all user pages from parent_pd to child_pd.
+///
+/// Walks the parent's page directory, and for each present user page,
+/// allocates a new frame for the child and copies the page contents.
+fn copy_user_pages(parent_pd: *mut u32, child_pd: *mut u32, _parent_tid: i32, child_tid: i32) -> bool {
+    let phys_base_pde = PHYS_BASE >> 22;
+
+    // We need to be in the parent's address space to read user pages via
+    // their kernel mappings (ptov of physical address).
+    unsafe {
+        for pde_idx in 0..phys_base_pde {
+            let pde = *parent_pd.add(pde_idx);
+            if pde & crate::mem::vaddr::PTE_P == 0 {
+                continue;
+            }
+            let pt_phys = (pde & crate::mem::vaddr::PTE_ADDR) as usize;
+            let pt = ptov(pt_phys) as *mut u32;
+
+            for pte_idx in 0..1024 {
+                let pte = *pt.add(pte_idx);
+                if pte & crate::mem::vaddr::PTE_P == 0 {
+                    continue;
+                }
+
+                let upage = (pde_idx << 22) | (pte_idx << 12);
+                let src_phys = (pte & crate::mem::vaddr::PTE_ADDR) as usize;
+                let src_kva = ptov(src_phys) as *const u8;
+                let writable = (pte & crate::mem::vaddr::PTE_W) != 0;
+
+                // Allocate a new frame for the child
+                let dst = crate::vm::frame::alloc_frame(upage, child_tid);
+                if dst.is_null() {
+                    return false;
+                }
+
+                // Copy page contents
+                core::ptr::copy_nonoverlapping(src_kva, dst, PGSIZE);
+
+                // Map the new frame in the child's page directory
+                if !pagedir::set_page(child_pd, upage, dst as usize, writable) {
+                    crate::vm::frame::free_frame(dst);
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Clone a supplementary page table.
+///
+/// For in-memory pages, mark them InMemory (they were just copied).
+/// For on-disk / zero pages, copy the entry as-is (demand-paged).
+/// Swap entries are NOT cloned (the copied pages are already in memory).
+fn clone_spt(parent_spt: &crate::vm::page::SupplementaryPageTable) -> crate::vm::page::SupplementaryPageTable {
+    use crate::vm::page::*;
+    let mut child_spt = SupplementaryPageTable::new();
+    for entry in parent_spt.iter() {
+        let new_location = match entry.location {
+            PageLocation::InMemory => PageLocation::InMemory,
+            PageLocation::InSwap(_) => {
+                // Swapped pages were loaded when we copied parent pages,
+                // so mark as InMemory in the child.
+                PageLocation::InMemory
+            }
+            other => other,
+        };
+        child_spt.insert(SptEntry {
+            vaddr: entry.vaddr,
+            location: new_location,
+            page_type: entry.page_type,
+            writable: entry.writable,
+            inode_sector: entry.inode_sector,
+            file_offset: entry.file_offset,
+            read_bytes: entry.read_bytes,
+            page_ofs: entry.page_ofs,
+        });
+    }
+    child_spt
+}
+
+/// Clone the parent's FD table: re-open each file by inode sector.
+fn clone_fd_table(_parent_tid: i32) -> *mut FdTable {
+    let parent_t = thread::running_thread();
+    let parent_fdt_ptr = unsafe { (*parent_t).fd_table };
+    if parent_fdt_ptr.is_null() {
+        return Box::into_raw(FdTable::new());
+    }
+    let parent_fdt = unsafe { &*parent_fdt_ptr };
+    let mut child = FdTable::new();
+
+    // Ensure child has same number of slots
+    while child.files.len() < parent_fdt.files.len() {
+        child.files.push(None);
+    }
+
+    // Clone each open file descriptor (skip 0,1 = stdin/stdout)
+    for i in 2..parent_fdt.files.len() {
+        if let Some(ref file) = parent_fdt.files[i] {
+            let sector = file.inode_sector;
+            if let Some(mut new_file) = File::open(sector) {
+                // Preserve the file position
+                let pos = file.tell();
+                new_file.seek(pos);
+                child.files[i] = Some(new_file);
+            }
+        }
+    }
+
+    Box::into_raw(child)
+}
+
+/// Fix frame table entries: replace placeholder owner_tid with the real child tid.
+fn fix_frame_owner(placeholder: i32, real_tid: i32) {
+    crate::vm::frame::fix_owner_tid(placeholder, real_tid);
+}
 
 // ---- Process execution -----------------------------------------------------
 
