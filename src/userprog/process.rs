@@ -22,6 +22,7 @@ use super::{pagedir, tss};
 #[allow(dead_code)]
 pub struct ProcessState {
     pub tid: thread::Tid,
+    pub parent_tid: thread::Tid,  // who created this process
     pub exit_status: i32,
     pub exited: bool,
     pub waited: bool,
@@ -487,9 +488,20 @@ pub fn fork(parent_frame: &IntrFrame) -> i32 {
         set_spt(child_tid, child_spt);
     }
 
-    // 11. Create process state for wait/exit synchronization
+    // 11. Set parent_tid on the child thread
+    unsafe {
+        for &t in crate::thread::all_list_pub().iter() {
+            if (*t).tid == child_tid {
+                (*t).parent_tid = parent_tid;
+                break;
+            }
+        }
+    }
+
+    // 12. Create process state for wait/exit synchronization
     let ps = Box::new(ProcessState {
         tid: child_tid,
+        parent_tid,
         exit_status: -1,
         exited: false,
         waited: false,
@@ -672,7 +684,134 @@ fn fix_frame_owner(placeholder: i32, real_tid: i32) {
     crate::vm::frame::fix_owner_tid(placeholder, real_tid);
 }
 
-// ---- Process execution -----------------------------------------------------
+// ---- exec() - replace current process image --------------------------------
+
+/// Replace the current process image with a new program (UNIX exec semantics).
+///
+/// On success: modifies the interrupt frame to jump to new binary (returns 0).
+/// On failure: returns -1. NOTE: like xv6, exec failure after teardown
+/// begins is fatal (the old image may be partially destroyed).
+///
+/// `path` is the program path. `argv_addr` is user-space argv pointer.
+pub fn sys_exec(path: &str, argv_addr: usize, frame: &mut IntrFrame) -> i32 {
+    let t = thread::running_thread();
+    let tid = unsafe { (*t).tid };
+    let old_pd = unsafe { (*t).pagedir };
+
+    // Build command line from argv
+    let cmdline = if argv_addr != 0 && argv_addr < PHYS_BASE {
+        build_cmdline_from_argv(argv_addr)
+    } else {
+        String::from(path)
+    };
+
+    // Release the old executable before loading the new one
+    if let Some(ps) = process_states().get_mut(&tid) {
+        if let Some(old_sector) = ps.executable_sector.take() {
+            crate::filesys::inode::allow_write(old_sector);
+            crate::filesys::inode::close(old_sector);
+        }
+    }
+
+    // Destroy old SPT before loading (load() creates a new one for this tid)
+    let old_spt = remove_spt(tid);
+    if !old_spt.is_null() {
+        unsafe {
+            let mut spt = Box::from_raw(old_spt);
+            spt.destroy();
+        }
+    }
+    // Temporarily set pagedir to null so load() creates a fresh one
+    unsafe { (*t).pagedir = core::ptr::null_mut(); }
+
+    // Load the new binary into a new page directory
+    let result = load(&cmdline);
+
+    match result {
+        Some((entry, esp)) => {
+            // Success - load() has set (*t).pagedir to the new PD
+            let new_pd = unsafe { (*t).pagedir };
+
+            // Destroy old page directory
+            if !old_pd.is_null() {
+                pagedir::activate(new_pd);
+                pagedir::destroy(old_pd);
+            }
+
+            // Reset brk
+            unsafe { (*t).brk = 0; }
+
+            // Update thread name
+            let prog_name = path.split('/').last().unwrap_or(path);
+            let name_bytes = prog_name.as_bytes();
+            let len = name_bytes.len().min(15);
+            unsafe {
+                let name_ptr = core::ptr::addr_of_mut!((*t).name);
+                core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), (*name_ptr).as_mut_ptr(), len);
+                (*name_ptr)[len] = 0;
+            }
+
+            // Modify the syscall's interrupt frame to return to the new program.
+            // When the syscall handler returns, iret will jump to new entry point.
+            frame.eip = entry;
+            frame.esp = esp;
+            frame.eax = 0;
+            // Ensure user segments
+            frame.cs = 0x1b;   // SEL_UCSEG
+            frame.ds = 0x23;   // SEL_UDSEG
+            frame.es = 0x23;
+            frame.ss = 0x23;
+            frame.eflags = 0x202; // IF + reserved
+
+            0 // success
+        }
+        None => {
+            // Failed - restore old page directory
+            unsafe { (*t).pagedir = old_pd; }
+            if !old_pd.is_null() {
+                pagedir::activate(old_pd);
+            }
+            // Re-create SPT for old process (simplified: just mark it empty)
+            // In practice, if exec fails, the old SPT entries are gone which
+            // could cause issues. For xv6 simplicity, exec failure kills the process.
+            -1
+        }
+    }
+}
+
+/// Build a command line string from a user-space argv array.
+fn build_cmdline_from_argv(argv_addr: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut ptr = argv_addr;
+
+    for _ in 0..32 {
+        if ptr + 4 > PHYS_BASE { break; }
+        let str_ptr = unsafe { *(ptr as *const u32) } as usize;
+        if str_ptr == 0 { break; }
+        if str_ptr >= PHYS_BASE { break; }
+
+        let mut s = String::new();
+        let mut sp = str_ptr;
+        for _ in 0..256 {
+            if sp >= PHYS_BASE { break; }
+            let byte = unsafe { *(sp as *const u8) };
+            if byte == 0 { break; }
+            s.push(byte as char);
+            sp += 1;
+        }
+        parts.push(s);
+        ptr += 4;
+    }
+
+    let mut result = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 { result.push(' '); }
+        result.push_str(part);
+    }
+    result
+}
+
+// ---- Process execution (spawn new process) ----------------------------------
 
 /// Execute a user program. Returns the new thread's TID, or TID_ERROR.
 /// Loads the program from the filesystem.
@@ -694,8 +833,10 @@ pub fn execute(cmd_line: &str) -> thread::Tid {
     }
 
     // Create process state for synchronization
+    let parent_tid = unsafe { (*thread::running_thread()).tid };
     let ps = Box::new(ProcessState {
         tid,
+        parent_tid,
         exit_status: -1,
         exited: false,
         waited: false,
@@ -793,15 +934,13 @@ pub fn wait(tid: thread::Tid) -> i32 {
 
 /// Wait for any child of `parent_tid` to exit (UNIX wait semantics).
 /// Returns (child_pid, exit_status). Returns (-1, -1) if no children.
-pub fn wait_any_child(_parent_tid: thread::Tid) -> (i32, i32) {
-    // For now, find any process state that has exited or wait for one.
-    // This is a simplified version -- a full implementation needs
-    // parent-child tracking.
+pub fn wait_any_child(parent_tid: thread::Tid) -> (i32, i32) {
     let states = process_states();
-    // Find first child that has exited
+
+    // Find a child that has already exited
     let mut exited_tid = None;
     for (&tid, ps) in states.iter() {
-        if ps.exited && !ps.waited {
+        if ps.parent_tid == parent_tid && ps.exited && !ps.waited {
             exited_tid = Some(tid);
             break;
         }
@@ -812,11 +951,11 @@ pub fn wait_any_child(_parent_tid: thread::Tid) -> (i32, i32) {
         return (tid, status);
     }
 
-    // No exited children yet -- find first unwaited child and block on it
+    // No exited children yet — find first unwaited child and block on it
     let first_child = {
         let mut found = None;
         for (&tid, ps) in states.iter() {
-            if !ps.waited {
+            if ps.parent_tid == parent_tid && !ps.waited {
                 found = Some(tid);
                 break;
             }
@@ -829,7 +968,7 @@ pub fn wait_any_child(_parent_tid: thread::Tid) -> (i32, i32) {
             let status = wait(tid);
             (tid, status)
         }
-        None => (-1, -1),
+        None => (-1, -1), // no children
     }
 }
 

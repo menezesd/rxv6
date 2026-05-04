@@ -162,6 +162,11 @@ fn all_list() -> &'static mut Vec<*mut Thread> {
     static_mut!(ALL_LIST)
 }
 
+/// Public read-only access to the all-threads list.
+pub fn all_list_pub() -> &'static Vec<*mut Thread> {
+    all_list()
+}
+
 
 fn allocate_tid() -> Tid {
     unsafe {

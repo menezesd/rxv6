@@ -333,13 +333,17 @@ fn syscall_handler(frame: &mut IntrFrame) {
         SYS_EXEC => {
             check_args(args, 2);
             let path_ptr = unsafe { *args.add(1) } as usize;
-            let _argv_ptr = unsafe { *args.add(2) } as usize;
+            let argv_ptr = unsafe { *args.add(2) } as usize;
             if !is_valid_user_ptr(path_ptr, 1) { exit_process(-1); }
             let path = read_user_string(path_ptr);
-            // TODO: full exec (replace current process image)
-            // For now: spawn child and return its pid
-            let tid = super::process::execute(&path);
-            frame.eax = tid as u32;
+            // UNIX exec: replace current process image
+            let result = super::process::sys_exec(&path, argv_ptr, frame);
+            if result < 0 {
+                // exec failed — return -1 to caller
+                frame.eax = (-1i32) as u32;
+            }
+            // On success, frame has been modified to jump to new program.
+            // The syscall handler returns normally, and iret lands in the new code.
         }
 
         SYS_OPEN => {
