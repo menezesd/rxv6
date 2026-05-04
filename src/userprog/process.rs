@@ -229,83 +229,125 @@ const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
 // ---- FD table -------------------------------------------------------------
 
+/// A file descriptor can refer to a regular file or a pipe end.
+pub enum FdKind {
+    FileDesc(Box<File>),
+    PipeRead(u32),   // pipe ID, read end
+    PipeWrite(u32),  // pipe ID, write end
+}
+
 /// File descriptor table for a user process.
 pub struct FdTable {
-    files: Vec<Option<Box<File>>>,
+    pub files: Vec<Option<FdKind>>,
 }
 
 impl FdTable {
     /// Create a new FD table with stdin (0) and stdout (1) reserved.
     pub fn new() -> Box<Self> {
         let mut ft = Box::new(FdTable { files: Vec::new() });
-        ft.files.push(None); // fd 0 = stdin (handled specially)
-        ft.files.push(None); // fd 1 = stdout (handled specially)
+        ft.files.push(None); // fd 0 = stdin
+        ft.files.push(None); // fd 1 = stdout
         ft
     }
 
-    /// Insert a file and return the assigned fd (>= 2).
-    pub fn open(&mut self, file: Box<File>) -> i32 {
-        // Find first empty slot starting from fd 2
+    /// Allocate the lowest available fd for a given FdKind.
+    fn alloc_fd(&mut self, kind: FdKind) -> i32 {
         for i in 2..self.files.len() {
             if self.files[i].is_none() {
-                self.files[i] = Some(file);
+                self.files[i] = Some(kind);
                 return i as i32;
             }
         }
         let fd = self.files.len() as i32;
-        self.files.push(Some(file));
+        self.files.push(Some(kind));
         fd
     }
 
-    /// Get a mutable reference to the file at `fd`.
-    pub fn get(&mut self, fd: i32) -> Option<&mut File> {
-        if fd < 2 { return None; }
-        self.files.get_mut(fd as usize)?.as_mut().map(|f| &mut **f)
+    /// Insert a file and return the assigned fd (>= 2).
+    pub fn open(&mut self, file: Box<File>) -> i32 {
+        self.alloc_fd(FdKind::FileDesc(file))
     }
 
-    /// Close the file at `fd`. Returns true if it was open.
+    /// Insert a pipe read end and return the assigned fd.
+    pub fn open_pipe_read(&mut self, pipe_id: u32) -> i32 {
+        self.alloc_fd(FdKind::PipeRead(pipe_id))
+    }
+
+    /// Insert a pipe write end and return the assigned fd.
+    pub fn open_pipe_write(&mut self, pipe_id: u32) -> i32 {
+        self.alloc_fd(FdKind::PipeWrite(pipe_id))
+    }
+
+    /// Get a mutable reference to the File at `fd`, or None if not a file.
+    pub fn get(&mut self, fd: i32) -> Option<&mut File> {
+        if fd < 2 { return None; }
+        match self.files.get_mut(fd as usize)? {
+            Some(FdKind::FileDesc(f)) => Some(&mut **f),
+            _ => None,
+        }
+    }
+
+    /// Get the FdKind at `fd` (for pipe dispatch).
+    pub fn get_kind(&self, fd: i32) -> Option<&FdKind> {
+        if fd < 0 || (fd as usize) >= self.files.len() { return None; }
+        self.files[fd as usize].as_ref()
+    }
+
+    /// Close the fd. Returns true if it was open.
     pub fn close(&mut self, fd: i32) -> bool {
         if fd < 2 { return false; }
         if let Some(slot) = self.files.get_mut(fd as usize) {
-            if let Some(file) = slot.take() {
-                file.close_file();
+            if let Some(kind) = slot.take() {
+                match kind {
+                    FdKind::FileDesc(file) => file.close_file(),
+                    FdKind::PipeRead(id) => {
+                        if let Some(pipe) = crate::pipe::get_pipe(id) {
+                            pipe.close_read();
+                        }
+                    }
+                    FdKind::PipeWrite(id) => {
+                        if let Some(pipe) = crate::pipe::get_pipe(id) {
+                            pipe.close_write();
+                        }
+                    }
+                }
                 return true;
             }
         }
         false
     }
 
-    /// Close all open files (used on process exit).
+    /// Close all open fds (process exit).
     pub fn close_all(&mut self) {
-        for slot in self.files.iter_mut().skip(2) {
-            if let Some(file) = slot.take() {
-                file.close_file();
+        for i in 2..self.files.len() {
+            if self.files[i].is_some() {
+                self.close(i as i32);
             }
         }
     }
 
     /// Duplicate a file descriptor (UNIX dup). Returns new fd, or -1.
     pub fn dup(&mut self, fd: i32) -> i32 {
-        if fd < 0 { return -1; }
-        if (fd as usize) >= self.files.len() { return -1; }
-
-        // For stdin/stdout/stderr (0, 1, 2), just allocate a new slot
-        // that refers to the same special fd (handled in syscall dispatch).
-        if fd < 2 {
-            // Dup stdin/stdout: find empty slot and mark it as a dup
-            // For now, just return a new fd number (the syscall handler
-            // will route reads/writes for fds 0/1 specially).
-            return -1; // TODO: proper stdin/stdout dup
-        }
+        if fd < 0 || (fd as usize) >= self.files.len() { return -1; }
 
         match &self.files[fd as usize] {
-            Some(file) => {
-                // Re-open the same inode to get a new File handle
+            Some(FdKind::FileDesc(file)) => {
                 let sector = file.inode_sector;
                 match File::open(sector) {
-                    Some(new_file) => self.open(new_file),
+                    Some(mut new_file) => {
+                        new_file.seek(file.pos);
+                        self.alloc_fd(FdKind::FileDesc(new_file))
+                    }
                     None => -1,
                 }
+            }
+            Some(FdKind::PipeRead(id)) => {
+                let id = *id;
+                self.alloc_fd(FdKind::PipeRead(id))
+            }
+            Some(FdKind::PipeWrite(id)) => {
+                let id = *id;
+                self.alloc_fd(FdKind::PipeWrite(id))
             }
             None => -1,
         }
@@ -580,22 +622,25 @@ fn clone_fd_table(_parent_tid: i32) -> *mut FdTable {
     let parent_fdt = unsafe { &*parent_fdt_ptr };
     let mut child = FdTable::new();
 
-    // Ensure child has same number of slots
     while child.files.len() < parent_fdt.files.len() {
         child.files.push(None);
     }
 
-    // Clone each open file descriptor (skip 0,1 = stdin/stdout)
     for i in 2..parent_fdt.files.len() {
-        if let Some(ref file) = parent_fdt.files[i] {
-            let sector = file.inode_sector;
-            if let Some(mut new_file) = File::open(sector) {
-                // Preserve the file position
-                let pos = file.tell();
-                new_file.seek(pos);
-                child.files[i] = Some(new_file);
+        child.files[i] = match &parent_fdt.files[i] {
+            Some(FdKind::FileDesc(file)) => {
+                let sector = file.inode_sector;
+                if let Some(mut new_file) = File::open(sector) {
+                    new_file.seek(file.pos);
+                    Some(FdKind::FileDesc(new_file))
+                } else {
+                    None
+                }
             }
-        }
+            Some(FdKind::PipeRead(id)) => Some(FdKind::PipeRead(*id)),
+            Some(FdKind::PipeWrite(id)) => Some(FdKind::PipeWrite(*id)),
+            None => None,
+        };
     }
 
     Box::into_raw(child)

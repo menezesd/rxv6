@@ -25,6 +25,7 @@ mod console;
 mod devices;
 mod filesys;
 mod mem;
+mod pipe;
 mod sync;
 mod thread;
 mod userprog;
@@ -66,6 +67,9 @@ pub extern "C" fn main() -> ! {
     // Virtual memory
     vm::frame::init();
     vm::swap::init();
+
+    // Pipes
+    pipe::init();
 
     kprintln!("cpu, mem, vm, devices: ok");
 

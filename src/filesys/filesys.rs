@@ -161,6 +161,42 @@ pub fn mkdir(path: &str) -> bool {
     true
 }
 
+/// Create a hard link: add `new_path` as a new name for the file at `old_path`.
+pub fn link(old_path: &str, new_path: &str) -> bool {
+    // Look up the existing file
+    let (parent, name) = match resolve_path(old_path) {
+        Some(x) => x,
+        None => return false,
+    };
+    if name.is_empty() { parent.close_dir(); return false; }
+    let sector = match parent.lookup(&name) {
+        Some(s) => s,
+        None => { parent.close_dir(); return false; }
+    };
+    parent.close_dir();
+
+    // Can't link directories
+    if inode::is_dir(sector) { return false; }
+
+    // Add the new name pointing to the same inode sector
+    let (mut new_parent, new_name) = match resolve_path(new_path) {
+        Some(x) => x,
+        None => return false,
+    };
+    if new_name.is_empty() { new_parent.close_dir(); return false; }
+
+    // Bump the inode's open count (keeps it alive)
+    inode::open(sector);
+    let ok = new_parent.add(&new_name, sector);
+    new_parent.close_dir();
+
+    if !ok {
+        inode::close(sector);
+        return false;
+    }
+    true
+}
+
 /// Format the filesystem: create free map and root directory.
 fn do_format(sector_count: u32) {
     let _ = sector_count;

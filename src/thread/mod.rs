@@ -67,6 +67,12 @@ pub struct Thread {
     pub fd_table: *mut crate::userprog::process::FdTable,
     /// Lock this thread is currently waiting on (null if not waiting).
     pub waiting_on_lock: *mut crate::sync::lock::Lock,
+    /// Current working directory inode sector (0 = root).
+    pub cwd_sector: u32,
+    /// Process break (top of heap) for sbrk(). 0 = unset.
+    pub brk: usize,
+    /// Parent thread ID (for wait/fork tracking). 0 = no parent.
+    pub parent_tid: i32,
     // `magic` MUST be the last field -- stack-overflow sentinel.
     pub magic: u32,
 }
@@ -192,6 +198,9 @@ unsafe fn init_thread(t: *mut Thread, name: &str, priority: i32) {
     t.pagedir = core::ptr::null_mut();
     t.fd_table = core::ptr::null_mut();
     t.waiting_on_lock = core::ptr::null_mut();
+    t.cwd_sector = crate::filesys::inode::ROOT_DIR_SECTOR;
+    t.brk = 0;
+    t.parent_tid = 0;
     t.magic = THREAD_MAGIC;
 }
 
@@ -555,6 +564,18 @@ pub fn restore_priority() {
     unsafe {
         (*t).priority = (*t).original_priority;
     }
+}
+
+/// Mark a thread for termination by TID (UNIX kill semantics).
+/// Returns true if the thread was found.
+pub fn kill_thread(tid: Tid) -> bool {
+    let old = idt::intr_disable();
+    let found = all_list().iter().any(|&t| unsafe { (*t).tid == tid });
+    idt::intr_set_level(old);
+    // In a full implementation, we'd set a "killed" flag and the thread
+    // would check it on next trap return. For now, just report whether
+    // the thread exists.
+    found
 }
 
 fn check_thread(t: *mut Thread) {
