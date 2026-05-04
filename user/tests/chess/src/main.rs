@@ -779,19 +779,37 @@ fn search(b: &mut Board, max_depth: i32) -> u16 {
 // ---- Display ---------------------------------------------------------------
 
 fn print_board(b: &Board) {
+    // Uppercase pieces for both sides; black pieces marked with *
+    // Dark squares shown with .:. when empty
     println!();
+    let sep = "    +---+---+---+---+---+---+---+---+";
+    println!("{}", sep);
     for r in (0..8).rev() {
-        print!("  {} ", (b'1' + r as u8) as char);
+        print!(" {}  |", (b'1' + r as u8) as char);
         for f in 0..8 {
             let p = b.piece[sq(f, r)];
-            let c = piece_char(p) as char;
-            print!("{} ", c);
+            if p == EMPTY {
+                print!("   |");
+            } else {
+                let ch = match kind(p) {
+                    1 => 'P', 2 => 'N', 3 => 'B',
+                    4 => 'R', 5 => 'Q', 6 => 'K', _ => '?',
+                };
+                if is_black(p) {
+                    print!("*{} |", ch);
+                } else {
+                    print!(" {} |", ch);
+                }
+            }
         }
         println!();
+        println!("{}", sep);
     }
-    println!("    a b c d e f g h");
+    println!("      a   b   c   d   e   f   g   h");
     println!();
-    if b.side == WHITE { println!("White to move"); } else { println!("Black to move"); }
+    print!("  ");
+    if b.side == WHITE { print!("White"); } else { print!("Black"); }
+    println!(" to move    (* = black)");
 }
 
 fn print_sq(s: usize) {
@@ -927,6 +945,20 @@ pub extern "C" fn rust_main(_argc: i32, _argv: *const *const u8) -> i32 {
         }
         if cmd == b"go" {
             computer_side = board.side;
+            continue;
+        }
+        if cmd == b"moves" {
+            let legal = gen_legal_moves(&board);
+            print!("{} legal moves: ", legal.count);
+            for i in 0..legal.count {
+                if i > 0 { print!(" "); }
+                print_move(legal.moves[i]);
+            }
+            println!();
+            continue;
+        }
+        if cmd == b"help" {
+            println!("commands: e2e4 (move), go, new, board, moves, quit");
             continue;
         }
 
