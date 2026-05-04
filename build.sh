@@ -13,7 +13,7 @@ PROGS=(
     mkdir-cmd:mkdir rm ln-cmd:ln kill-cmd:kill head-cmd:head
     tail-cmd:tail sleep-cmd:sleep date-cmd:date true-cmd:true
     false-cmd:false clear-cmd:clear tr-cmd:tr uname-cmd:uname
-    chess dc expr cal factor yes-cmd:yes tetris
+    chess dc expr cal factor yes-cmd:yes tetris nano
     printf-cmd:printf basename-cmd:basename dirname-cmd:dirname
     xargs-cmd:xargs find-cmd:find
 )
