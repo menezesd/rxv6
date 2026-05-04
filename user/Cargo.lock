@@ -66,6 +66,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "chess"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "child-bad"
 version = "0.1.0"
 dependencies = [
