@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use rustos_user::println;
+use rxv6_user::println;
 
 #[no_mangle]
 pub extern "C" fn rust_main(_argc: i32, _argv: *const *const u8) -> i32 {

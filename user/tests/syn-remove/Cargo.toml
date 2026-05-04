@@ -3,7 +3,7 @@ name = "syn-remove"
 version = "0.1.0"
 edition = "2021"
 [dependencies]
-rustos-user = { path = "../../rustos-user" }
+rxv6-user = { path = "../../rxv6-user" }
 [profile.dev]
 panic = "abort"
 [profile.release]
