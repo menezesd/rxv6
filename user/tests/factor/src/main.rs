@@ -143,8 +143,9 @@ fn is_prime(n: u64) -> bool {
     let mut r = 0u32;
     while d % 2 == 0 { d /= 2; r += 1; }
 
-    // Witnesses sufficient for all n < 2^64
-    let witnesses: [u64; 7] = [2, 3, 5, 7, 11, 13, 17];
+    // These 7 SPRP bases are deterministically correct for all n < 2^64.
+    // (Jim Sinclair, 2011)
+    let witnesses: [u64; 7] = [2, 325, 9375, 28178, 450775, 9780504, 1795265022];
     for &a in &witnesses {
         if a >= n { continue; }
         if !miller_test(a, d, n, r) { return false; }
