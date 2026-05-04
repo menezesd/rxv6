@@ -1,5 +1,5 @@
 [package]
-name = "rustos-user"
+name = "rxv6-user"
 version = "0.1.0"
 edition = "2021"
 

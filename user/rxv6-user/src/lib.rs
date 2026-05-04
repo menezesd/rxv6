@@ -1,3 +1,7 @@
+//! rxv6 user-space runtime library.
+//!
+//! Provides syscall wrappers, entry point, and basic I/O for user programs.
+
 #![no_std]
 
 pub mod syscall;
@@ -5,22 +9,17 @@ pub mod syscall;
 use core::fmt;
 
 // Entry point: the kernel places [fake_ret_addr] [argc] [argv] on the stack.
-// We pop the fake return address, then `call rust_main` pushes our own return
-// address, leaving [ret_addr] [argc] [argv] -- exactly the cdecl layout for
-// rust_main(argc, argv).
 core::arch::global_asm!(
     ".global _start",
     "_start:",
     "pop eax",            // discard fake return address
     "call rust_main",     // rust_main(argc, argv) via cdecl
-    "push eax",           // push exit code
-    "push 1",             // SYS_EXIT
-    "int 0x30",           // exit syscall
-    "jmp _start",         // should never reach here
+    "push eax",           // push exit code (arg0)
+    "push 2",             // SYS_EXIT
+    "int 0x80",           // exit syscall
+    "jmp _start",         // unreachable
 );
 
-// User programs define a `#[no_mangle] pub extern "C" fn rust_main(argc, argv) -> i32`.
-// We declare it here so the linker resolves it.
 extern "C" {
     fn rust_main(argc: i32, argv: *const *const u8) -> i32;
 }
@@ -66,13 +65,8 @@ pub unsafe fn cstr_to_str(ptr: *const u8) -> &'static str {
     core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr, len))
 }
 
-/// Test helper: print a test message in Pintos format.
-pub fn msg(test_name: &str, message: &str) {
-    print!("({}) {}\n", test_name, message);
-}
-
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("USER PANIC: {}", info);
-    syscall::exit(-1);
+    println!("panic: {}", info);
+    syscall::exit(1);
 }

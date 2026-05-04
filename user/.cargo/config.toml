@@ -3,9 +3,8 @@ build-std = ["core"]
 build-std-features = ["compiler-builtins-mem"]
 
 [build]
-target = "/Users/dean/rustos/user/i686-rustos-user.json"
-rustc = "/Users/dean/.cargo/bin/rustc"
+target = "/Users/dean/rxv6/user/i686-rxv6-user.json"
 
 [target.'cfg(all())']
-rustflags = ["-C", "link-arg=-T/Users/dean/rustos/user/linker.ld"]
+rustflags = ["-C", "link-arg=-T/Users/dean/rxv6/user/linker.ld"]
 json-target-spec = true

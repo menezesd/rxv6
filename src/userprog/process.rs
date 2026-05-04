@@ -283,6 +283,33 @@ impl FdTable {
             }
         }
     }
+
+    /// Duplicate a file descriptor (UNIX dup). Returns new fd, or -1.
+    pub fn dup(&mut self, fd: i32) -> i32 {
+        if fd < 0 { return -1; }
+        if (fd as usize) >= self.files.len() { return -1; }
+
+        // For stdin/stdout/stderr (0, 1, 2), just allocate a new slot
+        // that refers to the same special fd (handled in syscall dispatch).
+        if fd < 2 {
+            // Dup stdin/stdout: find empty slot and mark it as a dup
+            // For now, just return a new fd number (the syscall handler
+            // will route reads/writes for fds 0/1 specially).
+            return -1; // TODO: proper stdin/stdout dup
+        }
+
+        match &self.files[fd as usize] {
+            Some(file) => {
+                // Re-open the same inode to get a new File handle
+                let sector = file.inode_sector;
+                match File::open(sector) {
+                    Some(new_file) => self.open(new_file),
+                    None => -1,
+                }
+            }
+            None => -1,
+        }
+    }
 }
 
 // ---- Process activation ----------------------------------------------------
@@ -426,6 +453,48 @@ pub fn wait(tid: thread::Tid) -> i32 {
     let ps = process_states().remove(&tid)
         .expect("wait: process state vanished during wait");
     ps.exit_status
+}
+
+/// Wait for any child of `parent_tid` to exit (UNIX wait semantics).
+/// Returns (child_pid, exit_status). Returns (-1, -1) if no children.
+pub fn wait_any_child(_parent_tid: thread::Tid) -> (i32, i32) {
+    // For now, find any process state that has exited or wait for one.
+    // This is a simplified version -- a full implementation needs
+    // parent-child tracking.
+    let states = process_states();
+    // Find first child that has exited
+    let mut exited_tid = None;
+    for (&tid, ps) in states.iter() {
+        if ps.exited && !ps.waited {
+            exited_tid = Some(tid);
+            break;
+        }
+    }
+
+    if let Some(tid) = exited_tid {
+        let status = wait(tid);
+        return (tid, status);
+    }
+
+    // No exited children yet -- find first unwaited child and block on it
+    let first_child = {
+        let mut found = None;
+        for (&tid, ps) in states.iter() {
+            if !ps.waited {
+                found = Some(tid);
+                break;
+            }
+        }
+        found
+    };
+
+    match first_child {
+        Some(tid) => {
+            let status = wait(tid);
+            (tid, status)
+        }
+        None => (-1, -1),
+    }
 }
 
 /// Called when the current process exits.
