@@ -224,7 +224,7 @@ impl Dir {
             if n < DIR_ENTRY_SIZE as i32 { return None; }
             let entry = bytes_to_entry(&buf);
             if entry.in_use != 0 {
-                let name_len = entry.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX);
+                let name_len = entry.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX + 1);
                 let name = core::str::from_utf8(&entry.name[..name_len]).ok()?;
                 if name != "." && name != ".." {
                     return Some(String::from(name));
@@ -245,7 +245,7 @@ impl Dir {
             if n < DIR_ENTRY_SIZE as i32 { break; }
             let entry = bytes_to_entry(&buf);
             if entry.in_use != 0 {
-                let name_len = entry.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX);
+                let name_len = entry.name.iter().position(|&b| b == 0).unwrap_or(NAME_MAX + 1);
                 if let Ok(name) = core::str::from_utf8(&entry.name[..name_len]) {
                     if name != "." && name != ".." {
                         return false;

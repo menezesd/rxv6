@@ -691,13 +691,13 @@ fn clone_fd_table(_parent_tid: i32) -> *mut FdTable {
         return Box::into_raw(FdTable::new());
     }
     let parent_fdt = unsafe { &*parent_fdt_ptr };
-    let mut child = FdTable::new();
+    let mut child = Box::new(FdTable { files: Vec::new() });
 
     while child.files.len() < parent_fdt.files.len() {
         child.files.push(None);
     }
 
-    for i in 2..parent_fdt.files.len() {
+    for i in 0..parent_fdt.files.len() {
         child.files[i] = match &parent_fdt.files[i] {
             Some(FdKind::FileDesc(file)) => {
                 let sector = file.inode_sector;
