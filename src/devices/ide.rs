@@ -277,11 +277,18 @@ impl BlockOps for IdeBlockOps {
                 }
                 // Wait for DRQ.
                 let status_port = Port::new(base + REG_STATUS);
+                let mut have_drq = false;
                 for _ in 0..100_000u32 {
                     if status_port.read_u8() & STA_DRQ != 0 {
+                        have_drq = true;
                         break;
                     }
                     core::hint::spin_loop();
+                }
+                if !have_drq {
+                    crate::kprintln!("ide: write DRQ timeout on sector {}", sector);
+                    channels[self.channel_idx].lock.release();
+                    return;
                 }
 
                 outsw(base, buf);

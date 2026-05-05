@@ -8,7 +8,7 @@
 //! On recovery after crash, if the log header indicates a committed
 //! transaction, the logged sectors are re-installed.
 
-use crate::devices::block::{self, BlockSector, BlockType, BLOCK_SECTOR_SIZE};
+use crate::devices::block::{self, BlockSector, BlockType};
 use crate::sync::Lock;
 
 /// Maximum sectors per transaction.

@@ -7,9 +7,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use crate::arch::idt::{self, IntrFrame, IntrLevel};
-use crate::mem::vaddr::{PHYS_BASE, PGSIZE};
+use crate::mem::vaddr::{PHYS_BASE, PGSIZE, USER_STACK_MAX};
 use super::process::FdKind;
-
 // Syscall numbers (must match user/rxv6-user/src/syscall.rs)
 const SYS_FORK: u32 = 1;
 const SYS_EXIT: u32 = 2;
@@ -40,9 +39,20 @@ const SYS_GETPGID: u32 = 25;
 const SIG_DFL: u32 = 0;
 const SIG_IGN: u32 = 1;
 
+// Open flags
+const O_RDONLY: i32 = 0;
+const O_WRONLY: i32 = 1;
+#[allow(dead_code)]
+const O_RDWR: i32 = 2;
+const O_ACCMODE: i32 = 3;
 const O_CREATE: i32 = 0x200;
 const O_TRUNC: i32 = 0x400;
 const O_APPEND: i32 = 0x800;
+
+// fstat file types
+const T_DIR: u16 = 1;
+const T_FILE: u16 = 2;
+const T_DEV: u16 = 3;
 
 // ioctl requests
 const TIOCRAW: u32 = 0x5401;   // Set raw mode (arg: 0=cooked, 1=raw)
@@ -76,7 +86,7 @@ fn is_valid_user_ptr(addr: usize, size: usize) -> bool {
                     continue;
                 }
             }
-            let stack_limit = PHYS_BASE - 8 * 1024 * 1024;
+            let stack_limit = PHYS_BASE - USER_STACK_MAX;
             if page >= stack_limit && page < PHYS_BASE { return true; }
             return false;
         }
@@ -117,8 +127,14 @@ fn validate_user_buffer(addr: usize, size: usize) {
 fn read_user_string(addr: usize) -> String {
     let mut s = String::new();
     let mut ptr = addr;
+    // Validate one page at a time instead of per-byte
+    let mut validated_end = addr & !(PGSIZE - 1); // start of current page
     loop {
-        if !is_valid_user_ptr(ptr, 1) { exit_process(-1); }
+        if ptr >= validated_end {
+            // Validate the next page
+            validated_end = (ptr & !(PGSIZE - 1)) + PGSIZE;
+            if !is_valid_user_ptr(ptr, 1) { exit_process(-1); }
+        }
         let byte = unsafe { *(ptr as *const u8) };
         if byte == 0 { break; }
         s.push(byte as char);
@@ -161,7 +177,10 @@ fn sys_write(fd: i32, buf_addr: usize, size: usize) -> i32 {
         }
         Some(FdKind::FileDesc(_)) => {
             match fd_table.get(fd) {
-                Some(file) => bounced_write(file, buf_addr, size),
+                Some(f) => {
+                    if (f.mode & O_ACCMODE) == O_RDONLY { return -1; }
+                    bounced_write(f, buf_addr, size)
+                }
                 None => -1,
             }
         }
@@ -194,6 +213,7 @@ fn sys_read(fd: i32, buf_addr: usize, size: usize) -> i32 {
                 let mut n = 0;
                 for b in buf.iter_mut() {
                     let c = crate::devices::input::getc();
+                    if c == 0 { break; } // killed
                     if c == 0x04 { break; } // Ctrl-D = EOF
                     *b = c;
                     n += 1;
@@ -211,7 +231,10 @@ fn sys_read(fd: i32, buf_addr: usize, size: usize) -> i32 {
         }
         Some(FdKind::FileDesc(_)) => {
             match fd_table.get(fd) {
-                Some(file) => bounced_read(file, buf_addr, size),
+                Some(f) => {
+                    if (f.mode & O_ACCMODE) == O_WRONLY { return -1; }
+                    bounced_read(f, buf_addr, size)
+                }
                 None => -1,
             }
         }
@@ -417,22 +440,23 @@ fn syscall_handler(frame: &mut IntrFrame) {
                 frame.eax = fd_table.alloc_dev(FdKind::Console) as u32;
             } else {
                 if (flags & O_CREATE) != 0 {
-                    if crate::filesys::filesys::open(&path).is_none() {
-                        crate::filesys::filesys::create(&path, 0);
-                    }
+                    // Try to create; fails harmlessly if file already exists
+                    let _ = crate::filesys::filesys::create(&path, 0);
                 }
 
+                let mode = flags & O_ACCMODE;
                 match crate::filesys::filesys::open(&path) {
-                    Some(mut file) => {
+                    Some(mut f) => {
+                        f.mode = mode;
                         if (flags & O_TRUNC) != 0 {
-                            crate::filesys::inode::truncate(file.inode_sector);
+                            crate::filesys::inode::truncate(f.inode_sector);
                         }
                         if (flags & O_APPEND) != 0 {
-                            let len = file.length();
-                            file.seek(len);
+                            let len = f.length();
+                            f.seek(len);
                         }
                         let fd_table = super::process::get_fd_table();
-                        frame.eax = fd_table.open(file) as u32;
+                        frame.eax = fd_table.open(f) as u32;
                     }
                     None => frame.eax = (-1i32) as u32,
                 }
@@ -464,7 +488,7 @@ fn syscall_handler(frame: &mut IntrFrame) {
                 Some(FdKind::Console) | Some(FdKind::DevNull) | Some(FdKind::DevZero));
             if is_dev {
                 let stat = Stat {
-                    file_type: 3, // T_DEV
+                    file_type: T_DEV,
                     dev: 0,
                     ino: 0,
                     nlink: 1,
@@ -485,7 +509,7 @@ fn syscall_handler(frame: &mut IntrFrame) {
                         let is_dir = crate::filesys::inode::is_dir(sector);
                         let length = crate::filesys::inode::length(sector);
                         let stat = Stat {
-                            file_type: if is_dir { 1 } else { 2 },
+                            file_type: if is_dir { T_DIR } else { T_FILE },
                             dev: 0,
                             ino: sector,
                             nlink: 1,
@@ -530,20 +554,26 @@ fn syscall_handler(frame: &mut IntrFrame) {
             let path_ptr = unsafe { *args.add(1) } as usize;
             if !is_valid_user_ptr(path_ptr, 1) { exit_process(-1); }
             let path = read_user_string(path_ptr);
-            // Look up the directory
-            match crate::filesys::filesys::open(&path) {
-                Some(file) => {
-                    let sector = file.inode_sector;
-                    if crate::filesys::inode::is_dir(sector) {
-                        let t = crate::thread::running_thread();
-                        unsafe { (*t).cwd_sector = sector; }
-                        frame.eax = 0;
-                    } else {
-                        frame.eax = (-1i32) as u32;
+            // Handle root directory specially (resolve_path returns empty leaf for "/")
+            if !path.is_empty() && path.bytes().all(|b| b == b'/') {
+                let t = crate::thread::running_thread();
+                unsafe { (*t).cwd_sector = crate::filesys::inode::ROOT_DIR_SECTOR; }
+                frame.eax = 0;
+            } else {
+                match crate::filesys::filesys::open(&path) {
+                    Some(file) => {
+                        let sector = file.inode_sector;
+                        if crate::filesys::inode::is_dir(sector) {
+                            let t = crate::thread::running_thread();
+                            unsafe { (*t).cwd_sector = sector; }
+                            frame.eax = 0;
+                        } else {
+                            frame.eax = (-1i32) as u32;
+                        }
+                        file.close_file();
                     }
-                    file.close_file();
+                    None => frame.eax = (-1i32) as u32,
                 }
-                None => frame.eax = (-1i32) as u32,
             }
         }
 
@@ -587,6 +617,9 @@ fn syscall_handler(frame: &mut IntrFrame) {
                             if crate::userprog::pagedir::get_page(pd, page).is_null() {
                                 let kpage = crate::vm::frame::alloc_frame(page, tid);
                                 if kpage.is_null() {
+                                    // Out of memory. Partial pages are mapped but brk
+                                    // is not advanced, so they're unused but harmless
+                                    // (freed on process exit with the page directory).
                                     frame.eax = (-1i32) as u32;
                                     return;
                                 }

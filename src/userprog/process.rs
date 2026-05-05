@@ -57,6 +57,13 @@ static mut NEXT_MAPID: i32 = 1;
 /// in Thread struct (which would shrink the 4KB kernel stack).
 static mut SPT_TABLE: Option<BTreeMap<i32, *mut crate::vm::page::SupplementaryPageTable>> = None;
 
+/// Per-parent semaphore for wait_any_child: signaled when any child exits.
+static mut PARENT_WAIT_SEMAS: Option<BTreeMap<thread::Tid, Semaphore>> = None;
+
+fn parent_wait_semas() -> &'static mut BTreeMap<thread::Tid, Semaphore> {
+    static_mut!(PARENT_WAIT_SEMAS)
+}
+
 fn spt_table() -> &'static mut BTreeMap<i32, *mut crate::vm::page::SupplementaryPageTable> {
     static_mut!(SPT_TABLE)
 }
@@ -179,6 +186,7 @@ pub fn init() {
         PROCESS_STATES = Some(BTreeMap::new());
         SPT_TABLE = Some(BTreeMap::new());
         MMAP_TABLE = Some(BTreeMap::new());
+        PARENT_WAIT_SEMAS = Some(BTreeMap::new());
     }
 }
 
@@ -308,20 +316,7 @@ impl FdTable {
         if fd < 0 || (fd as usize) >= self.files.len() { return false; }
         if let Some(slot) = self.files.get_mut(fd as usize) {
             if let Some(kind) = slot.take() {
-                match kind {
-                    FdKind::FileDesc(file) => file.close_file(),
-                    FdKind::PipeRead(id) => {
-                        if let Some(pipe) = crate::pipe::get_pipe(id) {
-                            pipe.close_read();
-                        }
-                    }
-                    FdKind::PipeWrite(id) => {
-                        if let Some(pipe) = crate::pipe::get_pipe(id) {
-                            pipe.close_write();
-                        }
-                    }
-                    FdKind::Console | FdKind::DevNull | FdKind::DevZero => {}
-                }
+                close_kind(kind);
                 return true;
             }
         }
@@ -332,20 +327,7 @@ impl FdTable {
     pub fn close_all(&mut self) {
         for slot in self.files.iter_mut() {
             if let Some(kind) = slot.take() {
-                match kind {
-                    FdKind::FileDesc(file) => file.close_file(),
-                    FdKind::PipeRead(id) => {
-                        if let Some(pipe) = crate::pipe::get_pipe(id) {
-                            pipe.close_read();
-                        }
-                    }
-                    FdKind::PipeWrite(id) => {
-                        if let Some(pipe) = crate::pipe::get_pipe(id) {
-                            pipe.close_write();
-                        }
-                    }
-                    FdKind::Console | FdKind::DevNull | FdKind::DevZero => {}
-                }
+                close_kind(kind);
             }
         }
     }
@@ -361,7 +343,8 @@ impl FdTable {
             Some(FdKind::FileDesc(file)) => {
                 let sector = file.inode_sector;
                 let pos = file.pos;
-                match File::open(sector) {
+                let mode = file.mode;
+                match File::open_with_mode(sector, mode) {
                     Some(mut new_file) => {
                         new_file.seek(pos);
                         self.alloc_fd(FdKind::FileDesc(new_file))
@@ -371,16 +354,44 @@ impl FdTable {
             }
             Some(FdKind::PipeRead(id)) => {
                 let id = *id;
+                if let Some(pipe) = crate::pipe::get_pipe(id) {
+                    pipe.ref_read();
+                }
                 self.alloc_fd(FdKind::PipeRead(id))
             }
             Some(FdKind::PipeWrite(id)) => {
                 let id = *id;
+                if let Some(pipe) = crate::pipe::get_pipe(id) {
+                    pipe.ref_write();
+                }
                 self.alloc_fd(FdKind::PipeWrite(id))
             }
             Some(FdKind::DevNull) => self.alloc_fd(FdKind::DevNull),
             Some(FdKind::DevZero) => self.alloc_fd(FdKind::DevZero),
             None => -1,
         }
+    }
+}
+
+/// Close an FdKind, handling pipe refcount and auto-cleanup.
+fn close_kind(kind: FdKind) {
+    match kind {
+        FdKind::FileDesc(file) => file.close_file(),
+        FdKind::PipeRead(id) => {
+            if let Some(pipe) = crate::pipe::get_pipe(id) {
+                if pipe.close_read() {
+                    crate::pipe::destroy_pipe(id);
+                }
+            }
+        }
+        FdKind::PipeWrite(id) => {
+            if let Some(pipe) = crate::pipe::get_pipe(id) {
+                if pipe.close_write() {
+                    crate::pipe::destroy_pipe(id);
+                }
+            }
+        }
+        FdKind::Console | FdKind::DevNull | FdKind::DevZero => {}
     }
 }
 
@@ -414,6 +425,10 @@ struct ForkArgs {
     child_pd: *mut u32,
     /// Child's FD table.
     child_fdt: *mut FdTable,
+    /// Inherited working directory.
+    cwd_sector: u32,
+    /// Inherited heap break.
+    brk: usize,
 }
 
 unsafe impl Send for ForkArgs {}
@@ -465,10 +480,14 @@ pub fn fork(parent_frame: &IntrFrame) -> i32 {
     child_frame.eax = 0; // fork returns 0 in child
 
     // 7. Package fork args for the child thread
+    let parent_cwd = unsafe { (*parent_t).cwd_sector };
+    let parent_brk = unsafe { (*parent_t).brk };
     let fork_args = Box::new(ForkArgs {
         frame: child_frame,
         child_pd,
         child_fdt,
+        cwd_sector: parent_cwd,
+        brk: parent_brk,
     });
     let args_ptr = Box::into_raw(fork_args) as *mut u8;
 
@@ -479,6 +498,13 @@ pub fn fork(parent_frame: &IntrFrame) -> i32 {
     if child_tid == thread::TID_ERROR {
         // Clean up on failure
         unsafe { drop(Box::from_raw(args_ptr as *mut ForkArgs)); }
+        // Close the cloned FD table (child_fdt is Copy, still valid after ForkArgs drop)
+        if !child_fdt.is_null() {
+            unsafe {
+                let mut fdt = Box::from_raw(child_fdt);
+                fdt.close_all();
+            }
+        }
         if !child_spt.is_null() {
             unsafe {
                 let mut spt = Box::from_raw(child_spt);
@@ -498,19 +524,11 @@ pub fn fork(parent_frame: &IntrFrame) -> i32 {
     }
 
     // 11. Set parent_tid and inherit pgid/sig_ignore on the child thread
-    unsafe {
+    let (parent_pgid, parent_sig_ignore) = unsafe {
         let parent_t = crate::thread::running_thread();
-        let parent_pgid = (*parent_t).pgid;
-        let parent_sig_ignore = (*parent_t).sig_ignore;
-        for &t in crate::thread::all_list_pub().iter() {
-            if (*t).tid == child_tid {
-                (*t).parent_tid = parent_tid;
-                (*t).pgid = parent_pgid;
-                (*t).sig_ignore = parent_sig_ignore;
-                break;
-            }
-        }
-    }
+        ((*parent_t).pgid, (*parent_t).sig_ignore)
+    };
+    crate::thread::set_thread_parent_info(child_tid, parent_tid, parent_pgid, parent_sig_ignore);
 
     // 12. Create process state for wait/exit synchronization
     let ps = Box::new(ProcessState {
@@ -525,6 +543,11 @@ pub fn fork(parent_frame: &IntrFrame) -> i32 {
         executable_sector: exec_sector,
     });
     process_states().insert(child_tid, ps);
+
+    // Ensure parent has a wait semaphore (for wait_any_child)
+    if !parent_wait_semas().contains_key(&parent_tid) {
+        parent_wait_semas().insert(parent_tid, Semaphore::new(0));
+    }
 
     // If parent has an executable, open it again for the child (bump inode refcount)
     if let Some(sector) = exec_sector {
@@ -543,10 +566,12 @@ fn fork_child_entry(aux: *mut u8) {
     let args = unsafe { *Box::from_raw(aux as *mut ForkArgs) };
     let t = thread::running_thread();
 
-    // Install the child's page directory and FD table
+    // Install the child's page directory, FD table, CWD, and brk
     unsafe {
         (*t).pagedir = args.child_pd;
         (*t).fd_table = args.child_fdt;
+        (*t).cwd_sector = args.cwd_sector;
+        (*t).brk = args.brk;
     }
 
     // Activate the child's address space
@@ -676,15 +701,26 @@ fn clone_fd_table(_parent_tid: i32) -> *mut FdTable {
         child.files[i] = match &parent_fdt.files[i] {
             Some(FdKind::FileDesc(file)) => {
                 let sector = file.inode_sector;
-                if let Some(mut new_file) = File::open(sector) {
+                let mode = file.mode;
+                if let Some(mut new_file) = File::open_with_mode(sector, mode) {
                     new_file.seek(file.pos);
                     Some(FdKind::FileDesc(new_file))
                 } else {
                     None
                 }
             }
-            Some(FdKind::PipeRead(id)) => Some(FdKind::PipeRead(*id)),
-            Some(FdKind::PipeWrite(id)) => Some(FdKind::PipeWrite(*id)),
+            Some(FdKind::PipeRead(id)) => {
+                if let Some(pipe) = crate::pipe::get_pipe(*id) {
+                    pipe.ref_read();
+                }
+                Some(FdKind::PipeRead(*id))
+            }
+            Some(FdKind::PipeWrite(id)) => {
+                if let Some(pipe) = crate::pipe::get_pipe(*id) {
+                    pipe.ref_write();
+                }
+                Some(FdKind::PipeWrite(*id))
+            }
             Some(FdKind::Console) => Some(FdKind::Console),
             Some(FdKind::DevNull) => Some(FdKind::DevNull),
             Some(FdKind::DevZero) => Some(FdKind::DevZero),
@@ -754,9 +790,9 @@ pub fn sys_exec(path: &str, argv_addr: usize, frame: &mut IntrFrame) -> i32 {
                 pagedir::destroy(old_pd);
             }
 
-            // Reset brk and signal dispositions (POSIX: exec resets to SIG_DFL)
+            // Reset signal dispositions (POSIX: exec resets to SIG_DFL).
+            // brk is already set correctly by load_demand_paged().
             unsafe {
-                (*t).brk = 0;
                 (*t).sig_ignore = 0;
             }
 
@@ -776,10 +812,10 @@ pub fn sys_exec(path: &str, argv_addr: usize, frame: &mut IntrFrame) -> i32 {
             frame.esp = esp;
             frame.eax = 0;
             // Ensure user segments
-            frame.cs = 0x1b;   // SEL_UCSEG
-            frame.ds = 0x23;   // SEL_UDSEG
-            frame.es = 0x23;
-            frame.ss = 0x23;
+            frame.cs = crate::arch::gdt::SEL_UCSEG;
+            frame.ds = crate::arch::gdt::SEL_UDSEG;
+            frame.es = crate::arch::gdt::SEL_UDSEG;
+            frame.ss = crate::arch::gdt::SEL_UDSEG;
             frame.eflags = 0x202; // IF + reserved
 
             0 // success
@@ -865,6 +901,11 @@ pub fn execute(cmd_line: &str) -> thread::Tid {
         executable_sector: None,
     });
     process_states().insert(tid, ps);
+
+    // Ensure parent has a wait semaphore (for wait_any_child)
+    if !parent_wait_semas().contains_key(&parent_tid) {
+        parent_wait_semas().insert(parent_tid, Semaphore::new(0));
+    }
 
     // Wait for child to finish loading.
     // Safety: we just inserted this tid above, so get_mut must succeed.
@@ -953,41 +994,36 @@ pub fn wait(tid: thread::Tid) -> i32 {
 
 /// Wait for any child of `parent_tid` to exit (UNIX wait semantics).
 /// Returns (child_pid, exit_status). Returns (-1, -1) if no children.
+///
+/// Uses a per-parent semaphore so we wake when ANY child exits, not
+/// just a specific one.
 pub fn wait_any_child(parent_tid: thread::Tid) -> (i32, i32) {
-    let states = process_states();
-
-    // Find a child that has already exited
-    let mut exited_tid = None;
-    for (&tid, ps) in states.iter() {
-        if ps.parent_tid == parent_tid && ps.exited && !ps.waited {
-            exited_tid = Some(tid);
-            break;
-        }
+    // Ensure parent has a wait semaphore
+    if !parent_wait_semas().contains_key(&parent_tid) {
+        parent_wait_semas().insert(parent_tid, Semaphore::new(0));
     }
 
-    if let Some(tid) = exited_tid {
-        let status = wait(tid);
-        return (tid, status);
-    }
+    loop {
+        // Check for any exited, unwaited child
+        let exited = process_states().iter()
+            .find(|(_, ps)| ps.parent_tid == parent_tid && ps.exited && !ps.waited)
+            .map(|(&tid, _)| tid);
 
-    // No exited children yet — find first unwaited child and block on it
-    let first_child = {
-        let mut found = None;
-        for (&tid, ps) in states.iter() {
-            if ps.parent_tid == parent_tid && !ps.waited {
-                found = Some(tid);
-                break;
-            }
-        }
-        found
-    };
-
-    match first_child {
-        Some(tid) => {
+        if let Some(tid) = exited {
             let status = wait(tid);
-            (tid, status)
+            return (tid, status);
         }
-        None => (-1, -1), // no children
+
+        // Check if any children exist at all
+        let has_children = process_states().iter()
+            .any(|(_, ps)| ps.parent_tid == parent_tid && !ps.waited);
+
+        if !has_children {
+            return (-1, -1); // no children
+        }
+
+        // Block until a child exits
+        parent_wait_semas().get_mut(&parent_tid).unwrap().down();
     }
 }
 
@@ -995,6 +1031,7 @@ pub fn wait_any_child(parent_tid: thread::Tid) -> (i32, i32) {
 #[allow(dead_code)]
 pub fn exit() {
     exit_with_status(-1);
+    thread::exit();
 }
 
 /// Called when the current process exits with a specific status.
@@ -1013,6 +1050,14 @@ pub fn exit_with_status(status: i32) {
     // Unmap all mmap'd regions (write back dirty pages) before destroying page dir.
     munmap_all(tid);
 
+    // Signal parent's wait semaphore (for wait_any_child)
+    let parent_tid = process_states().get(&tid).map(|ps| ps.parent_tid);
+    if let Some(ptid) = parent_tid {
+        if let Some(sema) = parent_wait_semas().get_mut(&ptid) {
+            sema.up();
+        }
+    }
+
     // Record exit status and signal parent
     if let Some(ps) = process_states().get_mut(&tid) {
         ps.exit_status = status;
@@ -1020,11 +1065,28 @@ pub fn exit_with_status(status: i32) {
         ps.wait_sema.up();
     }
 
-    // Note: child ProcessState cleanup happens in wait() after
-    // the parent retrieves the exit status. States for children
-    // that were never waited on are leaked (acceptable for an
-    // educational OS - a production OS would track parent-child
-    // relationships and clean up on parent exit).
+    // Reparent or clean up children of the exiting process
+    {
+        let children: Vec<thread::Tid> = process_states().iter()
+            .filter(|(_, ps)| ps.parent_tid == tid)
+            .map(|(&child_tid, _)| child_tid)
+            .collect();
+        for child_tid in children {
+            let should_remove = process_states().get(&child_tid)
+                .map(|ps| ps.exited)
+                .unwrap_or(false);
+            if should_remove {
+                // Already exited, nobody will wait — remove
+                process_states().remove(&child_tid);
+            } else if let Some(ps) = process_states().get_mut(&child_tid) {
+                // Still running, reparent to init (tid 1)
+                ps.parent_tid = 1;
+            }
+        }
+    }
+
+    // Clean up parent wait semaphore
+    parent_wait_semas().remove(&tid);
 
     unsafe {
         // Clean up FD table
@@ -1121,6 +1183,8 @@ fn load_demand_paged(elf_data: &[u8], cmdline: &str, inode_sector: u32) -> Optio
 
     // Validate ELF
     if ehdr.e_ident[0..4] != ELF_MAGIC { return None; }
+    if ehdr.e_ident[4] != 1 { return None; } // EI_CLASS: must be 32-bit
+    if ehdr.e_ident[5] != 1 { return None; } // EI_DATA: must be little-endian
     if ehdr.e_type != 2 || ehdr.e_machine != 3 { return None; }
 
     let pd = pagedir::create();
@@ -1270,6 +1334,12 @@ fn load_demand_paged(elf_data: &[u8], cmdline: &str, inode_sector: u32) -> Optio
     };
 
     unsafe { (*t).pagedir = pd; }
+
+    // Initialize brk to end of loaded segments (heap starts here).
+    if !segments.is_empty() {
+        let end = segments.iter().map(|s| s.vaddr + s.memsz).max().unwrap();
+        unsafe { (*t).brk = crate::mem::vaddr::pg_round_up(end); }
+    }
 
     Some((entry, esp))
 }

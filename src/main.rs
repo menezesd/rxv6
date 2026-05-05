@@ -32,6 +32,7 @@ mod userprog;
 mod vm;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 core::arch::global_asm!(include_str!("../asm/start.S"), options(att_syntax));
 
@@ -78,7 +79,7 @@ pub extern "C" fn main() -> ! {
     if devices::block::get_by_name("hda").is_some() {
         devices::block::set_role(devices::block::BlockType::FileSys, 0);
         thread::create("fs-init", thread::PRI_DEFAULT, fs_init_thread, core::ptr::null_mut());
-        while !unsafe { FS_READY } {
+        while !FS_READY.load(Ordering::Acquire) {
             thread::yield_current();
         }
     } else {
@@ -98,11 +99,17 @@ pub extern "C" fn main() -> ! {
         }
     }
 
+    // Flush filesystem metadata before shutdown
+    if has_fs {
+        filesys::free_map::flush_if_safe();
+        filesys::bio::sync();
+    }
+
     kprintln!("rxv6: halted");
     devices::shutdown::power_off()
 }
 
-static mut FS_READY: bool = false;
+static FS_READY: AtomicBool = AtomicBool::new(false);
 
 fn fs_init_thread(_aux: *mut u8) {
     let dev = devices::block::get_role(devices::block::BlockType::FileSys)
@@ -110,7 +117,7 @@ fn fs_init_thread(_aux: *mut u8) {
     kprintln!("fs: {} sectors", dev.size);
     filesys::filesys::init(false);
     kprintln!("fs: mounted");
-    unsafe { FS_READY = true; }
+    FS_READY.store(true, Ordering::Release);
 }
 
 #[panic_handler]

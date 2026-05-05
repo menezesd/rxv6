@@ -5,7 +5,8 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use crate::devices::block::{self, BlockSector, BlockType, BLOCK_SECTOR_SIZE};
+use crate::devices::block::{BlockSector, BLOCK_SECTOR_SIZE};
+use super::bio;
 
 pub const FREE_MAP_SECTOR: u32 = 0;
 pub const ROOT_DIR_SECTOR: u32 = 1;
@@ -60,11 +61,6 @@ pub struct Inode {
     pub is_symlink: bool,
 }
 
-/// Allocate a zeroed sector buffer (delegates to shared block::sector_buf).
-fn sector_buf() -> Box<[u8; BLOCK_SECTOR_SIZE]> {
-    block::sector_buf()
-}
-
 /// Global map of open inodes, keyed by sector (O(log n) lookup).
 static mut OPEN_INODES: Option<BTreeMap<BlockSector, Box<Inode>>> = None;
 
@@ -73,47 +69,41 @@ fn open_inodes() -> &'static mut BTreeMap<BlockSector, Box<Inode>> {
     static_mut!(OPEN_INODES)
 }
 
-/// Index of the filesystem block device in the registry.
-static mut FS_DEVICE_SET: bool = false;
-
-fn fs_device() -> &'static mut block::BlockDevice {
-    block::get_role(BlockType::FileSys).expect("filesys: no FileSys block device")
-}
-
-fn block_read(sector: u32, buf: &mut [u8; BLOCK_SECTOR_SIZE]) {
-    fs_device().read(sector, buf);
-}
-
-fn block_write(sector: u32, buf: &[u8; BLOCK_SECTOR_SIZE]) {
-    fs_device().write(sector, buf);
-}
-
-/// Initialize the inode layer.
+/// Initialize the inode layer and buffer cache.
 pub fn init() {
-    // Safety: called once during single-threaded boot (before scheduler starts).
+    bio::init();
     unsafe {
         OPEN_INODES = Some(BTreeMap::new());
-        FS_DEVICE_SET = true;
     }
 }
 
-/// Read an InodeDisk from the given sector.
+/// Read an InodeDisk from the given sector (via buffer cache).
 pub fn read_inode_disk(sector: BlockSector) -> Box<InodeDisk> {
-    // Allocate directly on heap, then read into it, avoiding 512-byte stack temp.
     let mut disk = InodeDisk::new_boxed();
-    // Safety: InodeDisk is repr(C), exactly 512 bytes (== BLOCK_SECTOR_SIZE),
-    // so reinterpreting as a byte array for block I/O is valid.
-    let buf_ptr = &mut *disk as *mut InodeDisk as *mut [u8; BLOCK_SECTOR_SIZE];
-    block_read(sector, unsafe { &mut *buf_ptr });
+    let buf = bio::bread(sector);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            buf.data.as_ptr(),
+            &mut *disk as *mut InodeDisk as *mut u8,
+            BLOCK_SECTOR_SIZE,
+        );
+    }
+    bio::brelse(buf);
     disk
 }
 
-/// Write an InodeDisk to the given sector.
+/// Write an InodeDisk to the given sector (via buffer cache).
 pub fn write_inode_disk(sector: BlockSector, disk: &InodeDisk) {
-    // Safety: InodeDisk is repr(C) and exactly BLOCK_SECTOR_SIZE bytes,
-    // so reinterpreting as a byte array reference is valid.
-    let buf = unsafe { &*(disk as *const InodeDisk as *const [u8; BLOCK_SECTOR_SIZE]) };
-    block_write(sector, buf);
+    let buf = bio::bread(sector);
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            disk as *const InodeDisk as *const u8,
+            buf.data.as_mut_ptr(),
+            BLOCK_SECTOR_SIZE,
+        );
+    }
+    bio::bwrite(buf);
+    bio::brelse(buf);
 }
 
 /// Create a new inode on disk at the given sector.
@@ -132,8 +122,10 @@ pub fn create(sector: BlockSector, length: i32, is_dir: bool) -> bool {
         };
         set_block_sector(&mut disk, i, s);
         // Zero out the newly allocated sector.
-        let zero_buf = sector_buf();
-        block_write(s, &zero_buf);
+        let buf = bio::bread(s);
+        buf.data.fill(0);
+        bio::bwrite(buf);
+        bio::brelse(buf);
     }
 
     write_inode_disk(sector, &disk);
@@ -204,16 +196,15 @@ pub fn close(sector: BlockSector) {
                 }
                 // Free doubly indirect blocks if used.
                 if disk.doubly_indirect_block != 0 {
-                    let mut buf = sector_buf();
-                    block_read(disk.doubly_indirect_block, &mut buf);
-                    // Safety: buf is 512 bytes = 128 u32s = PTRS_PER_BLOCK entries.
-                    let ptrs = buf.as_ptr() as *const u32;
+                    let buf = bio::bread(disk.doubly_indirect_block);
+                    let ptrs = buf.data.as_ptr() as *const u32;
                     for j in 0..PTRS_PER_BLOCK {
                         let p = unsafe { *ptrs.add(j) };
                         if p != 0 {
                             super::free_map::release(p, 1);
                         }
                     }
+                    bio::brelse(buf);
                     super::free_map::release(disk.doubly_indirect_block, 1);
                 }
             }
@@ -228,14 +219,45 @@ pub fn remove(sector: BlockSector) {
     }
 }
 
-/// Truncate file to zero length.
+/// Truncate file to zero length, freeing all data blocks.
 pub fn truncate(sector: BlockSector) {
+    let old_length = length(sector);
+    let cnt = bytes_to_sectors(old_length);
+    let disk = read_inode_disk(sector);
+
+    // Free all data blocks.
+    for i in 0..cnt {
+        if let Some(s) = get_block_sector_disk(&disk, i) {
+            super::free_map::release(s, 1);
+        }
+    }
+    // Free indirect block.
+    if disk.indirect_block != 0 {
+        super::free_map::release(disk.indirect_block, 1);
+    }
+    // Free doubly indirect blocks.
+    if disk.doubly_indirect_block != 0 {
+        let buf = bio::bread(disk.doubly_indirect_block);
+        let ptrs = buf.data.as_ptr() as *const u32;
+        for j in 0..PTRS_PER_BLOCK {
+            let p = unsafe { *ptrs.add(j) };
+            if p != 0 {
+                super::free_map::release(p, 1);
+            }
+        }
+        bio::brelse(buf);
+        super::free_map::release(disk.doubly_indirect_block, 1);
+    }
+    drop(disk);
+
+    // Write zeroed inode back to disk.
+    let mut new_disk = InodeDisk::new_boxed();
+    new_disk.is_dir = if is_dir(sector) { 1 } else { 0 };
+    write_inode_disk(sector, &new_disk);
+
     if let Some(inode) = open_inodes().get_mut(&sector) {
         inode.length = 0;
     }
-    let mut disk = read_inode_disk(sector);
-    disk.length = 0;
-    write_inode_disk(sector, &disk);
 }
 
 /// Return the length of the inode in bytes.
@@ -280,18 +302,10 @@ pub fn read_at(sector: BlockSector, buf: &mut [u8], size: i32, offset: i32) -> i
         );
 
         if let Some(data_sector) = get_block_sector_disk(&disk, sector_idx) {
-            if sector_ofs == 0 && chunk_size == BLOCK_SECTOR_SIZE {
-                // Read directly into output buffer (needs a temp since block_read needs [u8; 512]).
-                let mut tmp = sector_buf();
-                block_read(data_sector, &mut tmp);
-                buf[buf_pos..buf_pos + chunk_size].copy_from_slice(&tmp[..chunk_size]);
-            } else {
-                // Bounce buffer for partial sector.
-                let mut bounce = sector_buf();
-                block_read(data_sector, &mut bounce);
-                buf[buf_pos..buf_pos + chunk_size]
-                    .copy_from_slice(&bounce[sector_ofs..sector_ofs + chunk_size]);
-            }
+            let cached = bio::bread(data_sector);
+            buf[buf_pos..buf_pos + chunk_size]
+                .copy_from_slice(&cached.data[sector_ofs..sector_ofs + chunk_size]);
+            bio::brelse(cached);
         } else {
             // Block not allocated, read as zeros.
             for b in &mut buf[buf_pos..buf_pos + chunk_size] {
@@ -349,9 +363,11 @@ pub fn write_at(sector: BlockSector, buf: &[u8], size: i32, offset: i32) -> i32 
             _ => {
                 // Need to allocate a new block.
                 if let Some(new_sec) = allocate_block_for(&mut disk, sector_idx) {
-                    // Zero the new sector.
-                    let zero_buf = sector_buf();
-                    block_write(new_sec, &zero_buf);
+                    // Zero the new sector via buffer cache.
+                    let zbuf = bio::bread(new_sec);
+                    zbuf.data.fill(0);
+                    bio::bwrite(zbuf);
+                    bio::brelse(zbuf);
                     new_sec
                 } else {
                     break; // out of space
@@ -359,18 +375,12 @@ pub fn write_at(sector: BlockSector, buf: &[u8], size: i32, offset: i32) -> i32 
             }
         };
 
-        if sector_ofs == 0 && chunk_size == BLOCK_SECTOR_SIZE {
-            // Write full sector.
-            let mut tmp = sector_buf();
-            tmp[..chunk_size].copy_from_slice(&buf[buf_pos..buf_pos + chunk_size]);
-            block_write(data_sector, &tmp);
-        } else {
-            // Read-modify-write for partial sector.
-            let mut bounce = sector_buf();
-            block_read(data_sector, &mut bounce);
-            bounce[sector_ofs..sector_ofs + chunk_size]
+        {
+            let cached = bio::bread(data_sector);
+            cached.data[sector_ofs..sector_ofs + chunk_size]
                 .copy_from_slice(&buf[buf_pos..buf_pos + chunk_size]);
-            block_write(data_sector, &bounce);
+            bio::bwrite(cached);
+            bio::brelse(cached);
         }
 
         bytes_written += chunk_size as i32;
@@ -418,10 +428,10 @@ fn get_block_sector_disk(disk: &InodeDisk, block_idx: u32) -> Option<u32> {
             return None;
         }
         let idx = block_idx as usize - DIRECT_PTR_CNT;
-        let mut buf = sector_buf();
-        block_read(disk.indirect_block, &mut buf);
-        let ptrs = buf.as_ptr() as *const u32;
+        let buf = bio::bread(disk.indirect_block);
+        let ptrs = buf.data.as_ptr() as *const u32;
         let s = unsafe { *ptrs.add(idx) };
+        bio::brelse(buf);
         if s == 0 { None } else { Some(s) }
     } else {
         // Doubly indirect.
@@ -432,18 +442,18 @@ fn get_block_sector_disk(disk: &InodeDisk, block_idx: u32) -> Option<u32> {
         let outer_idx = rel / PTRS_PER_BLOCK;
         let inner_idx = rel % PTRS_PER_BLOCK;
 
-        let mut buf = sector_buf();
-        block_read(disk.doubly_indirect_block, &mut buf);
-        let outer_ptrs = buf.as_ptr() as *const u32;
+        let buf = bio::bread(disk.doubly_indirect_block);
+        let outer_ptrs = buf.data.as_ptr() as *const u32;
         let inner_sector = unsafe { *outer_ptrs.add(outer_idx) };
+        bio::brelse(buf);
         if inner_sector == 0 {
             return None;
         }
 
-        let mut buf2 = sector_buf();
-        block_read(inner_sector, &mut buf2);
-        let inner_ptrs = buf2.as_ptr() as *const u32;
+        let buf2 = bio::bread(inner_sector);
+        let inner_ptrs = buf2.data.as_ptr() as *const u32;
         let s = unsafe { *inner_ptrs.add(inner_idx) };
+        bio::brelse(buf2);
         if s == 0 { None } else { Some(s) }
     }
 }
@@ -468,52 +478,65 @@ fn allocate_block_for(disk: &mut InodeDisk, block_idx: u32) -> Option<u32> {
         // Single indirect.
         if disk.indirect_block == 0 {
             disk.indirect_block = super::free_map::allocate(1)?;
-            let zero = sector_buf();
-            block_write(disk.indirect_block, &zero);
+            let zbuf = bio::bread(disk.indirect_block);
+            zbuf.data.fill(0);
+            bio::bwrite(zbuf);
+            bio::brelse(zbuf);
         }
         let idx = block_idx as usize - DIRECT_PTR_CNT;
-        let mut buf = sector_buf();
-        block_read(disk.indirect_block, &mut buf);
+        let buf = bio::bread(disk.indirect_block);
         unsafe {
-            let ptrs = buf.as_mut_ptr() as *mut u32;
+            let ptrs = buf.data.as_mut_ptr() as *mut u32;
             *ptrs.add(idx) = new_sector;
         }
-        block_write(disk.indirect_block, &buf);
+        bio::bwrite(buf);
+        bio::brelse(buf);
     } else {
         // Doubly indirect.
         if disk.doubly_indirect_block == 0 {
             disk.doubly_indirect_block = super::free_map::allocate(1)?;
-            let zero = sector_buf();
-            block_write(disk.doubly_indirect_block, &zero);
+            let zbuf = bio::bread(disk.doubly_indirect_block);
+            zbuf.data.fill(0);
+            bio::bwrite(zbuf);
+            bio::brelse(zbuf);
         }
         let rel = block_idx as usize - DIRECT_PTR_CNT - PTRS_PER_BLOCK;
         let outer_idx = rel / PTRS_PER_BLOCK;
         let inner_idx = rel % PTRS_PER_BLOCK;
 
-        let mut outer_buf = sector_buf();
-        block_read(disk.doubly_indirect_block, &mut outer_buf);
+        let outer_buf = bio::bread(disk.doubly_indirect_block);
         let inner_sector = unsafe {
-            let ptrs = outer_buf.as_mut_ptr() as *mut u32;
+            let ptrs = outer_buf.data.as_mut_ptr() as *mut u32;
             let s = *ptrs.add(outer_idx);
             if s == 0 {
-                let new_inner = super::free_map::allocate(1)?;
+                let new_inner = match super::free_map::allocate(1) {
+                    Some(s) => s,
+                    None => {
+                        bio::brelse(outer_buf);
+                        return None;
+                    }
+                };
                 *ptrs.add(outer_idx) = new_inner;
-                block_write(disk.doubly_indirect_block, &outer_buf);
-                let zero = sector_buf();
-                block_write(new_inner, &zero);
+                bio::bwrite(outer_buf);
+                bio::brelse(outer_buf);
+                let zbuf = bio::bread(new_inner);
+                zbuf.data.fill(0);
+                bio::bwrite(zbuf);
+                bio::brelse(zbuf);
                 new_inner
             } else {
+                bio::brelse(outer_buf);
                 s
             }
         };
 
-        let mut inner_buf = sector_buf();
-        block_read(inner_sector, &mut inner_buf);
+        let inner_buf = bio::bread(inner_sector);
         unsafe {
-            let ptrs = inner_buf.as_mut_ptr() as *mut u32;
+            let ptrs = inner_buf.data.as_mut_ptr() as *mut u32;
             *ptrs.add(inner_idx) = new_sector;
         }
-        block_write(inner_sector, &inner_buf);
+        bio::bwrite(inner_buf);
+        bio::brelse(inner_buf);
     }
 
     Some(new_sector)

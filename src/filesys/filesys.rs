@@ -29,12 +29,18 @@ pub fn init(format: bool) {
 }
 
 /// Resolve a path like "/foo/bar/baz" into (parent_dir, leaf_name).
-/// Returns the parent directory and the final component name.
-/// For absolute paths, starts at root. For relative paths (no leading /), starts at root too (no CWD yet).
+/// Absolute paths start at root. Relative paths start at the current
+/// thread's working directory (cwd_sector).
 fn resolve_path(path: &str) -> Option<(Box<Dir>, String)> {
     if path.is_empty() { return None; }
 
-    let dir = Dir::open_root()?;
+    let dir = if path.starts_with('/') {
+        Dir::open_root()?
+    } else {
+        let t = crate::thread::running_thread();
+        let cwd = unsafe { (*t).cwd_sector };
+        Dir::open(cwd)?
+    };
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     if parts.is_empty() {

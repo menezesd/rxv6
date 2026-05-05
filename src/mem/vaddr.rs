@@ -5,6 +5,9 @@
 /// Page size in bytes (4 KB).
 pub const PGSIZE: usize = 4096;
 
+/// Maximum user stack size (8 MB).
+pub const USER_STACK_MAX: usize = 8 * 1024 * 1024;
+
 /// Number of offset bits in a virtual address.
 pub const PGBITS: usize = 12;
 

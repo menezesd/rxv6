@@ -170,9 +170,21 @@ fn all_list() -> &'static mut Vec<*mut Thread> {
     static_mut!(ALL_LIST)
 }
 
-/// Public read-only access to the all-threads list.
-pub fn all_list_pub() -> &'static Vec<*mut Thread> {
-    all_list()
+/// Set parent info on a child thread (used by fork).
+/// Safely iterates the thread list with interrupts disabled.
+pub fn set_thread_parent_info(child_tid: Tid, parent_tid: Tid, pgid: Tid, sig_ignore: u32) {
+    let old = idt::intr_disable();
+    for &t in all_list().iter() {
+        unsafe {
+            if (*t).tid == child_tid {
+                (*t).parent_tid = parent_tid;
+                (*t).pgid = pgid;
+                (*t).sig_ignore = sig_ignore;
+                break;
+            }
+        }
+    }
+    idt::intr_set_level(old);
 }
 
 
@@ -651,6 +663,7 @@ pub fn check_signals() {
     unsafe {
         if (*t).killed {
             crate::userprog::process::exit_with_status(-1);
+            exit(); // never returns — must not iret after address space is destroyed
         }
     }
 }

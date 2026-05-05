@@ -724,6 +724,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano"
+version = "0.1.0"
+dependencies = [
+ "rxv6-user",
+]
+
+[[package]]
 name = "od"
 version = "0.1.0"
 dependencies = [

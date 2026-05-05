@@ -99,9 +99,8 @@ pub fn brelse(buf: &mut Buf) {
     bc.lock.release();
 }
 
-/// Mark a buffer as dirty (needs writeback).
+/// Write a buffer's contents to disk (write-through).
 pub fn bwrite(buf: &mut Buf) {
-    buf.flags |= B_DIRTY;
     write_sector(buf.sector, &buf.data);
     buf.flags &= !B_DIRTY;
 }

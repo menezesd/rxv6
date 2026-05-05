@@ -47,6 +47,12 @@ pub struct Dir {
     pub pos: i32,
 }
 
+impl Drop for Dir {
+    fn drop(&mut self) {
+        inode::close(self.inode_sector);
+    }
+}
+
 impl Dir {
     /// Open the root directory.
     pub fn open_root() -> Option<Box<Dir>> {
@@ -166,8 +172,12 @@ impl Dir {
             if entry.name_matches(name) {
                 // If the target is a directory, check it's empty.
                 if inode::is_dir(entry.inode_sector) {
+                    // Temporary Dir for is_empty check — not opened via inode::open,
+                    // so we must prevent Drop from calling inode::close.
                     let target_dir = Dir { inode_sector: entry.inode_sector, pos: 0 };
-                    if !target_dir.is_empty() {
+                    let empty = target_dir.is_empty();
+                    core::mem::forget(target_dir);
+                    if !empty {
                         return false; // non-empty directory
                     }
                 }
@@ -183,9 +193,9 @@ impl Dir {
         false
     }
 
-    /// Close this directory handle.
+    /// Close this directory handle (consumes self, triggering Drop).
     pub fn close_dir(self) {
-        inode::close(self.inode_sector);
+        // Drop impl handles inode::close
     }
 
     /// Open a directory by inode sector.

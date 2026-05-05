@@ -5,7 +5,7 @@
 
 use crate::arch::gdt::SEL_UCSEG;
 use crate::arch::idt::{self, IntrFrame, IntrLevel};
-use crate::mem::vaddr::{PGMASK, PHYS_BASE};
+use crate::mem::vaddr::{PGMASK, PHYS_BASE, USER_STACK_MAX};
 use crate::userprog::pagedir;
 use crate::vm::page::{PageLocation, PageType};
 
@@ -84,7 +84,7 @@ fn page_fault(frame: &mut IntrFrame) {
     if user && not_present {
         let fault = fault_addr as usize;
         let esp = frame.esp as usize;
-        let stack_limit = PHYS_BASE - 8 * 1024 * 1024; // max 8MB stack
+        let stack_limit = PHYS_BASE - USER_STACK_MAX;
 
         // Accept faults within 32 bytes below ESP (PUSHA pushes 32 bytes).
         // Normal stack accesses (sub esp, N; mov [esp], ...) fault at or
